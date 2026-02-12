@@ -1,0 +1,11 @@
+project:
+  type: website
+  output-dir: docs
+
+website:
+  title: "Proportional Fleet Redistribution"
+  navbar:
+    background: primary
+    left:
+      - href: index.qmd
+        text: Home
