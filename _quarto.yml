@@ -1,0 +1,12 @@
+project:
+  type: website
+  output-dir: docs
+
+website:
+  title: "Fleet Movement Model"
+  navbar:
+    left:
+      - text: "Home"
+        href: index.qmd
+      - text: "FMM Report"
+        href: FMM.qmd
