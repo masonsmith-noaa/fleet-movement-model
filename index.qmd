@@ -1,0 +1,451 @@
+---
+title: "Proportional Fleet Redistribution"
+date: today
+format: 
+  html:
+    theme: cosmo
+    toc: true
+    code-fold: true
+    embed-resources: false
+execute:
+  warning: false
+  message: false
+---
+
+## 1. Setup
+
+```{r}
+#| label: setup
+#| include: false
+
+# Load packages
+library(dplyr)
+library(terra)
+library(ggplot2)
+library(lubridate)
+library(tidyr)
+library(units)
+library(gridExtra)
+library(tidyterra)
+library(ggpubr)
+library(patchwork)
+library(ggpattern)
+library(data.table)
+library(sf)
+
+options(scipen=999)
+
+```
+
+## 2. Set Parameters
+
+Assign titles, timeframe, and closures
+
+```{r}
+# Parameters
+spp_title = "Species"
+title_name = "Closure"
+timeframe <- c(2011:2023)
+closure.stat.areas <- c(665730, 665700, 655730, 655700)
+```
+
+## 3. Spatial Data and Grid Setup
+
+Loading the Alaska background and statistical area shapefiles to create the time-series grid.
+
+```{r}
+#| label: load-spatial
+# Note: Ensure these paths are relative to your .qmd file location
+AK <- terra::vect("shapefiles/mv_alaska_1mil_py.shp")
+stat_areas <- terra::vect("shapefiles/State_Stat_2004.shp")
+stat_areas$STAT_AREA <- as.numeric(stat_areas$STAT_AREA)
+
+# Create timeseries list
+stat.list <- list()
+for (i in timeframe){
+  stat_shape <- stat_areas
+  stat_shape$YEAR <- i
+  stat.list[[as.character(i)]] <- stat_shape
+}
+stat.areas.timeseries <- terra::vect(stat.list)
+```
+
+## 4. Closure Assignment
+
+Defining the closure area based on specific statistical areas.
+
+```{r}
+#| label: closure-setup
+closure <- subset(stat_areas, stat_areas$STAT_AREA %in% closure.stat.areas)
+closure$closed <- "yes"
+closure2 <- terra::aggregate(closure)
+
+non_closure <- stat_areas[!(stat_areas$STAT_AREA %in% closure.stat.areas), ]
+non_closure$closed <- "no"
+```
+
+## 5. Simulation Data
+
+Simulating weekly catch data for 20 cells closest to the closure area. This is where you would also enter your own catch data. Here, we're also simulating a bias of higher PSC inside the hypothetical closure.
+
+```{r}
+#| label: simulation
+
+
+# --- 5. Simulation Data (Biased for high PSC inside closure) ---
+
+set.seed(123)
+num_to_select <- 20
+
+# 1. Calculate distances from non-closure to closure areas
+distances_to_closure <- terra::distance(non_closure, closure2)
+min_distances <- apply(distances_to_closure, MARGIN = 1, FUN = min)
+non_closure$dist_to_closure <- min_distances
+
+# 2. Select 20 areas outside but close to the closure
+non_closure_ordered <- non_closure[order(non_closure$dist_to_closure), ]
+sim_areas <- non_closure_ordered %>% slice(1:num_to_select)
+
+# 3. Merge back closure areas
+sim_areas <- rbind(sim_areas, closure)
+
+# 4. Generate Weekly Data with PSC Bias
+simulated_years <- c(2021, 2022, 2023)
+sim.list <- list()
+
+for(i in simulated_years){
+  
+  # Create a sequence of 5 weeks starting in August for each year
+  week_sequence <- seq.Date(from = as.Date(paste0(i, "-08-01")), 
+                            by = "week", length.out = 5)
+  year_weeks_list <- list()
+  
+  for(week_date in as.character(week_sequence)) {
+    
+    # Identify which rows are inside the closure for this specific loop
+    is_inside <- sim_areas$STAT_AREA %in% closure.stat.areas
+    num_inside <- sum(is_inside)
+    num_outside <- sum(!is_inside)
+    
+    # Create the data frame
+    wk_dat <- data.frame(
+      STAT_AREA = sim_areas$STAT_AREA,
+      YEAR = i,
+      WEEK_END_DATE = week_date,
+      CATCH_ACTIVITY_DATE = as.character(as.Date(week_date) - 2),
+      PROCESSING_SECTOR = "X"
+    )
+    
+    # Generate Groundfish catch (kept consistent across all areas)
+    wk_dat$GF_TOTAL_CATCH_MT <- round(rnorm(nrow(sim_areas), mean = 50, sd = 10), 2)
+    
+    # Generate PSC catch with Bias:
+    wk_dat$PSC_TOTAL_COUNT <- NA # Initialize
+    
+    # Higher PSC mean for inside areas (e.g., mean = 15)
+    wk_dat$PSC_TOTAL_COUNT[is_inside] <- round(rnorm(num_inside, mean = 10, sd = 3), 2)
+    
+    # Lower PSC mean for outside areas (e.g., mean = 5)
+    wk_dat$PSC_TOTAL_COUNT[!is_inside] <- round(rnorm(num_outside, mean = 5, sd = 2), 2)
+    
+    year_weeks_list[[week_date]] <- wk_dat
+  }
+  sim.list[[as.character(i)]] <- do.call(rbind, year_weeks_list)
+}
+
+catch_data <- do.call(rbind, sim.list)
+
+# 5. Merge catch data with spatvector
+# Using all.x = FALSE ensures the map only displays areas with data
+catch_data2 <- merge(stat_areas, catch_data, by = "STAT_AREA", all.x = FALSE)
+```
+
+## 6. Visualizations
+
+Weekly groundfish catch - simulated to be randomly distributed across the study area (closure + 20 adjacent stat areas).
+
+```{r}
+#| label: fig-gf-catch
+#| fig-cap: "Simulated weekly groundfish catch distributions."
+#| fig-width: 12
+#| fig-height: 8
+ggplot() +
+  tidyterra::geom_spatvector(data = catch_data2, aes(fill = GF_TOTAL_CATCH_MT), 
+                             alpha = 0.8, col = NA, na.rm = TRUE) +
+  scale_fill_distiller(palette = "GnBu", name = "Catch (MT)") +
+  tidyterra::geom_spatvector(data = closure2, aes(color = "Closure"), 
+                             fill = NA, alpha = 0.5, lwd = 0.5) +
+  scale_color_manual(values = c("Closure" = "red"), name = NULL) +
+  facet_wrap(~WEEK_END_DATE, ncol=5) +
+  theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank())
+```
+
+Weekly PSC catch - simulated to have higher PSC within the hypothetical closure.
+
+```{r}
+#| label: fig-psc-catch
+#| fig-cap: "Simulated weekly PSC distributions."
+#| fig-width: 12
+#| fig-height: 8
+
+ggplot() +
+  tidyterra::geom_spatvector(data = catch_data2, aes(fill = PSC_TOTAL_COUNT), 
+                             alpha = 0.8, col = NA, na.rm = TRUE) +
+  scale_fill_distiller(palette = "GnBu", name = "PSC Catch (Number)") +
+  tidyterra::geom_spatvector(data = closure2, aes(color = "Closure"), 
+                             fill = NA, alpha = 0.5, lwd = 0.5) +
+  scale_color_manual(values = c("Closure" = "red"), name = NULL) +
+  facet_wrap(~WEEK_END_DATE, ncol=5) +
+  theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank())
+
+
+```
+
+## 7. Assign Closure Dates & Isolate Impacted Hauls
+
+For this exercise, July 1 chosen as the closure date for each year. For year-long closures, choose January 1.
+
+```{r}
+
+#| label: impacted-hauls
+#| echo: false
+
+#sum status quo PSC by year for later joins
+all_psc_status_quo_annual <- as.data.frame(catch_data2) %>%
+  group_by(YEAR) %>%
+  reframe(
+    sum_psc_status_quo = sum(PSC_TOTAL_COUNT)
+  )
+
+#assign dates to data ---
+#set closure date
+closure_dates <- data.frame(
+  YEAR = c(2021,2022,2023),
+  PROCESSING_SECTOR = "X",
+  closure_date = c('2021-07-01','2022-07-01', '2023-07-01')
+)
+
+#assign dates
+all_psc_closures_dates <- as.data.frame(dplyr::left_join(catch_data2, closure_dates, by=c("YEAR", "PROCESSING_SECTOR")))
+
+
+#assign groundfish and psc based on date ---
+all_psc_closures_dates$closure <- ifelse(!is.na(all_psc_closures_dates$closure_date), "yes", "no")
+all_psc_closures_dates$impacted <- ifelse(all_psc_closures_dates$CATCH_ACTIVITY_DATE > all_psc_closures_dates$closure_date, "yes", "no")
+all_psc_closures_dates$tons_gf_after_closure <- ifelse(all_psc_closures_dates$impacted=="yes", all_psc_closures_dates$GF_TOTAL_CATCH_MT, 0)
+all_psc_closures_dates$tons_gf_no_closure <- ifelse(all_psc_closures_dates$impacted=="no" | is.na(all_psc_closures_dates$impacted), all_psc_closures_dates$GF_TOTAL_CATCH_MT, 0)
+
+
+#isolate impacted hauls
+all_psc_impacted <- subset(all_psc_closures_dates, impacted=="yes")
+
+```
+
+## 8. Calculate Catch and Proportions Inside/Outside Closure
+
+This step summarizes the data used in the main calculations - the proportions of outside groundish catch where displaced catch is applied to, under the assumption that the fishery will meet the same overall total catch, the total catch inside the closure to be applied to the proportions, the new PSC as a result of the new GF catch applied to local PSC rates, and the PSC caught inside the closure that will be subtracted from the net total.
+
+```{r}
+
+#| label: rates-props
+#| echo: false
+
+# Identify Inside/Outside after a closure would have occurred  ---
+
+#identify the area
+stat_areas_closed <- closure.stat.areas 
+
+#identify which hauls occurred inside/outside the closed area
+all_psc_impacted_cluster <- all_psc_impacted %>%
+  mutate(inside = case_when(STAT_AREA %in% c(stat_areas_closed) ~ "yes", TRUE ~ NA_character_))
+all_psc_impacted_cluster$inside[is.na(all_psc_impacted_cluster$inside)] <- "no" # NA cpue to 0s
+
+
+# -- inside catch -- #
+#isolate hauls occurring inside closed area
+gf_inside_cluster <- subset(all_psc_impacted_cluster, inside == "yes")
+
+#sum gf and psc inside closed area for later calcs
+gf_inside_cluster2 <- gf_inside_cluster %>%
+  group_by(YEAR, WEEK_END_DATE, PROCESSING_SECTOR) %>%
+  summarise(
+    tons_gf_inside_wk = sum(GF_TOTAL_CATCH_MT),
+    psc_measure_inside_wk = sum(PSC_TOTAL_COUNT)
+  )
+
+# -- outside catch -- #
+#isolate the hauls that occurred outside the closed area
+gf_outside_cluster <- subset(all_psc_impacted_cluster, inside == "no")
+
+gf_outside_cluster2 <- gf_outside_cluster %>%
+  group_by(YEAR, WEEK_END_DATE, PROCESSING_SECTOR) %>%
+  summarise(
+    tons_gf_outside_wk = sum(GF_TOTAL_CATCH_MT),
+    psc_measure_outside_wk = sum(PSC_TOTAL_COUNT)
+  )
+
+
+# summarize mean psc rates and calculate ratio of means  ---
+
+sum.stat.timeseries.gf_all <- gf_outside_cluster %>%
+  group_by(YEAR, WEEK_END_DATE, STAT_AREA, PROCESSING_SECTOR) %>%
+  reframe(
+    tons_gf_wk = sum(GF_TOTAL_CATCH_MT),
+    mean_psc_wk = mean(PSC_TOTAL_COUNT),
+    mean_gf_tons_wk = mean(GF_TOTAL_CATCH_MT)) 
+
+#ratio
+sum.stat.timeseries.gf_all$mean_psc_rate_wk <- sum.stat.timeseries.gf_all$mean_psc_wk/sum.stat.timeseries.gf_all$mean_gf_tons_wk
+
+
+# Proportions by YEAR and STAT_AREA  ---
+
+#isolate gf catch by week
+gf.outside.stat <- gf_outside_cluster %>%
+  group_by(YEAR, WEEK_END_DATE, STAT_AREA, PROCESSING_SECTOR) %>%
+  reframe(
+    tons_gf_annual_stat = sum(GF_TOTAL_CATCH_MT)
+  )
+
+# sum all catch outside
+gf.outside.annually <- gf_outside_cluster %>%
+  group_by(YEAR, WEEK_END_DATE,  PROCESSING_SECTOR) %>%
+  reframe(
+    tons_gf_annual = sum(GF_TOTAL_CATCH_MT))
+
+#join the the sums back to main
+sum.stat.timeseries.gf_all2 <- dplyr::left_join(sum.stat.timeseries.gf_all, gf.outside.annually, by = c("YEAR", "WEEK_END_DATE", "PROCESSING_SECTOR"))
+sum.stat.timeseries.gf_all3 <- dplyr::left_join(sum.stat.timeseries.gf_all2, gf.outside.stat, by = c("YEAR","WEEK_END_DATE", "STAT_AREA", "PROCESSING_SECTOR"))
+
+# CALC PROPORTION OF OUTSIDE CATCH FOR EACH AREA
+sum.stat.timeseries.gf_all3$proportion_outside_wk <- sum.stat.timeseries.gf_all3$tons_gf_annual_stat/sum.stat.timeseries.gf_all3$tons_gf_annual
+sum.stat.timeseries.gf_all3 <- as.data.frame(sum.stat.timeseries.gf_all3)
+
+
+```
+
+## 9. Plot Weekly Proportions
+
+This plot shows the proportions of groundfish catch for the 20 adjacent stat areas outside of the closure. These proportions will be what displaced catch is applied to, under the assumption that the fishery will meet the same overall total catch.
+
+```{r}
+#| label: fig-props
+#| fig-cap: "Simulated weekly GF Catch Proportions."
+#| fig-width: 12
+#| fig-height: 8
+
+#proportion
+sum.stat.timeseries.gf_all_shp <- dplyr::left_join(stat.areas.timeseries, sum.stat.timeseries.gf_all3, by=c("YEAR", "STAT_AREA"))
+sum.stat.timeseries.gf_all_shp <- terra::na.omit(sum.stat.timeseries.gf_all_shp, "PROCESSING_SECTOR")
+
+propdat <- sum.stat.timeseries.gf_all_shp
+propdat$label <- round(propdat$proportion_outside_wk, 2)
+
+ggplot() +
+  tidyterra::geom_spatvector(data=subset(propdat, propdat$proportion_outside_wk>0), aes(fill=proportion_outside_wk), alpha = 0.8, col=NA, na.rm=TRUE) +
+  scale_fill_distiller(palette = "GnBu", name = "Proportion of GF Catch") +
+  tidyterra::geom_spatvector(data = closure2, aes(color = "Closure"), 
+                             fill = NA, alpha = 0.5, lwd = 0.5) +
+  scale_color_manual(values = c("Closure" = "red"), name = NULL) +
+  facet_wrap(~WEEK_END_DATE, ncol=5) +
+  theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank())
+
+```
+
+## 10. Calculate Weekly and Annual Summary Statistics
+
+```{r}
+
+#| label: summary-stats
+#| echo: false
+
+#join catch from inside area
+total.join <- dplyr::left_join(sum.stat.timeseries.gf_all3,
+                               gf_inside_cluster2 %>% dplyr::select(YEAR, WEEK_END_DATE, PROCESSING_SECTOR, tons_gf_inside_wk),
+                               by=c("YEAR", "WEEK_END_DATE",  "PROCESSING_SECTOR"))
+
+#NAs to 0s to remove weeks where no catch happened inside the closed area
+total.join$tons_gf_inside_wk[is.na(total.join$tons_gf_inside_wk)] <- 0
+
+#multiply weekly displaced catch by the outside proportions
+total.join$displaced_gf_catch_wk <- total.join$tons_gf_inside_wk * total.join$proportion_outside_wk
+
+#multiply PSC rate by new gf catch
+total.join$new_PSC_wk <- total.join$displaced_gf_catch_wk * total.join$mean_psc_rate_wk
+
+
+#summarize by week and sector
+total.join2 <- total.join %>% group_by(YEAR, WEEK_END_DATE, PROCESSING_SECTOR) %>%
+  reframe(
+    tons_gf_inside_wk = max(tons_gf_inside_wk),
+    displaced_gf_catch_wk = sum(displaced_gf_catch_wk),
+    new_PSC_wk = sum(new_PSC_wk),
+    mean_psc_rate_wk = mean(mean_psc_rate_wk))
+
+#join the status quo inside psc numbers
+total.join3 <- dplyr::left_join(total.join2,
+                                gf_inside_cluster2 %>% dplyr::select(YEAR, WEEK_END_DATE, PROCESSING_SECTOR, psc_measure_inside_wk),
+                                by=c("YEAR", "WEEK_END_DATE", "PROCESSING_SECTOR"))
+#NAs to 0s
+total.join3$psc_measure_inside_wk[is.na(total.join3$psc_measure_inside_wk)] <- 0
+
+#subtract the PSC caught inside the area
+total.join3$net_change_PSC_wk <- total.join3$new_PSC_wk - total.join3$psc_measure_inside_wk
+
+total.join.plot <- total.join3
+
+
+#sum est changes for annual numbers
+total.join.plot.annual <- total.join.plot %>%
+  group_by(YEAR) %>%
+  reframe(
+    est_change_fleet = sum(net_change_PSC_wk)
+  )
+
+```
+
+## 11. Status Quo Comparison
+
+```{r}
+#| label: fig-status-quo
+#| fig-width: 8
+#| fig-height: 5
+
+# --- total by year (only estimated change) with status quo numbers --- #
+total.join.plot.annual2 <- dplyr::left_join(all_psc_status_quo_annual, total.join.plot.annual,  by=c("YEAR"))
+total.join.plot.annual2$est_change_fleet[is.na(total.join.plot.annual2$est_change_fleet)] <- 0
+total.join.plot.annual2$net_new_PSC <- total.join.plot.annual2$sum_psc_status_quo + total.join.plot.annual2$est_change_fleet
+total.join.plot.annual2$LABEL <- paste0("SPECIES")
+colnames(total.join.plot.annual2) <-  c("YEAR",  "psc_statusquo", "psc_change", "net_new_PSC","LABEL")
+total.join.plot.annual3 <- total.join.plot.annual2 %>% pivot_longer(
+  cols = c("net_new_PSC", "psc_statusquo"),
+  names_to = "psc_type",
+  names_prefix = "psc_",
+  values_to = "psc_amount",
+  values_drop_na = TRUE
+)
+
+
+# #plot
+ggplot(total.join.plot.annual3, aes(x = YEAR, y = psc_amount, fill = psc_type))  + ggtitle(paste0(spp_title, ": ", title_name)) +
+  geom_bar(stat = "identity", position = "dodge") + theme_bw() + labs(x="Year", y="Estimated Annual PSC (# Fish)") +
+  scale_fill_brewer(palette = "Paired", name="Closure", labels=c(title_name, "Status Quo")) +
+  theme(plot.title = element_text(hjust = 0.5)) 
+
+```
+
+## 12. Final Summary Statistics Table
+
+```{r}
+#| label: final-table
+#| fig-width: 8
+#| fig-height: 5
+
+#final summary table
+final.summary.table <- total.join.plot.annual2 %>% dplyr::select(YEAR, psc_statusquo, net_new_PSC, psc_change)
+final.summary.table <- as.data.frame(final.summary.table)
+colnames(final.summary.table) <- c("year", "PSC_status_quo", "PSC_closure", "Net_Change")
+final.summary.table$percent_change <- final.summary.table$Net_Change / final.summary.table$PSC_status_quo *100
+print(final.summary.table)
+
+```
