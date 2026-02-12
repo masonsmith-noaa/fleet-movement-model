@@ -2,8 +2,13 @@
 title: "Proportional Fleet Redistribution"
 format: 
   html:
+    theme: cosmo
     toc: true
     code-fold: true
+    embed-resources: false
+execute:
+  warning: false
+  message: false
 ---
 
 ## 1. Setup
@@ -398,48 +403,202 @@ total.join.plot.annual <- total.join.plot %>%
 
 ```
 
-## 11. Status Quo Comparison
+
+## 11. Bootstrap
+To provide a measure of uncertainty, we are bootstrapping 1,000 alternative scenarios by randomly shuffling the PSC rates where fishing is redistributed. We calculated a 95% Confidence Interval using the middle 95% of all simulated outcomes (between 2.5th and 97.5th percentiles).
+
+```{r}
+# Create a base dataframe that keeps STAT_AREA for resampling
+df_bs_base <- total.join %>%
+  left_join(gf_inside_cluster2 %>% 
+              select(YEAR, WEEK_END_DATE, PROCESSING_SECTOR, psc_measure_inside_wk),
+            by = c("YEAR", "WEEK_END_DATE", "PROCESSING_SECTOR")) %>%
+  mutate(psc_measure_inside_wk = replace_na(psc_measure_inside_wk, 0),
+         displaced_gf_catch_wk = tons_gf_inside_wk * proportion_outside_wk)
+
+set.seed(345)
+n_iterations <- 1000
+weeks <- unique(df_bs_base$WEEK_END_DATE)
+boot_results <- matrix(NA, nrow = n_iterations, ncol = length(weeks))
+colnames(boot_results) <- weeks
+
+for(i in 1:n_iterations) {
+  
+  # Temporary storage for this iteration
+  new_psc_iteration <- numeric(nrow(df_bs_base))
+  
+  for(w in weeks) {
+    wk_indices <- which(df_bs_base$WEEK_END_DATE == w)
+    
+    # THE FIX: Sample from the pool of all rates available this week
+    psc_pool <- df_bs_base$mean_psc_rate_wk[wk_indices]
+    
+    # Randomly assign a rate from the pool to each STAT_AREA
+    sampled_rates <- sample(psc_pool, size = length(wk_indices), replace = TRUE)
+    
+    # Calculate new PSC: (Fixed Displaced Catch) * (Randomly Sampled Rate)
+    new_psc_iteration[wk_indices] <- df_bs_base$displaced_gf_catch_wk[wk_indices] * sampled_rates
+  }
+  
+  # Summarize results for this iteration
+  df_iter <- df_bs_base
+  df_iter$new_psc_boot <- new_psc_iteration
+  
+  iter_summary <- df_iter %>%
+    group_by(WEEK_END_DATE) %>%
+    summarise(
+      net_change = sum(new_psc_boot) - max(psc_measure_inside_wk),
+      .groups = "drop"
+    )
+  
+  for(j in seq_along(weeks)) {
+    boot_results[i, j] <- iter_summary$net_change[iter_summary$WEEK_END_DATE == weeks[j]]
+  }
+}
+
+# 4. Calculate Confidence Intervals
+ci_summary <- data.frame(
+  WEEK_END_DATE = colnames(boot_results),
+  mean_net_change = colMeans(boot_results),
+  lower_ci = apply(boot_results, 2, quantile, probs = 0.025),
+  upper_ci = apply(boot_results, 2, quantile, probs = 0.975)
+)
+
+# 5. Merge with original modeled data for comparison
+final_comparison <- left_join(ci_summary, total.join3 %>% 
+                                select(WEEK_END_DATE, net_change_PSC_wk), 
+                              by = "WEEK_END_DATE")
+
+#summarize bootstrap data into annual
+# Convert matrix to long dataframe to join with Year info
+boot_long <- as.data.frame(boot_results) %>%
+  mutate(iteration = 1:n()) %>%
+  pivot_longer(-iteration, names_to = "WEEK_END_DATE", values_to = "net_change") %>%
+  mutate(WEEK_END_DATE = as.Date(WEEK_END_DATE),
+         YEAR = lubridate::year(WEEK_END_DATE))
+
+# Sum by iteration and year to get annual distribution of change
+boot_annual_dist <- boot_long %>%
+  group_by(iteration, YEAR) %>%
+  summarise(annual_psc_change = sum(net_change), .groups = "drop")
+
+# Calculate CIs for the annual change
+boot_annual_ci <- boot_annual_dist %>%
+  group_by(YEAR) %>%
+  summarise(
+    lower_change = quantile(annual_psc_change, 0.025),
+    upper_change = quantile(annual_psc_change, 0.975)
+  )
+
+
+
+```
+
+
+
+
+
+## 12. Status Quo Comparison
 
 ```{r}
 #| label: fig-status-quo
 #| fig-width: 8
 #| fig-height: 5
 
-# --- total by year (only estimated change) with status quo numbers --- #
-total.join.plot.annual2 <- dplyr::left_join(all_psc_status_quo_annual, total.join.plot.annual,  by=c("YEAR"))
-total.join.plot.annual2$est_change_fleet[is.na(total.join.plot.annual2$est_change_fleet)] <- 0
-total.join.plot.annual2$net_new_PSC <- total.join.plot.annual2$sum_psc_status_quo + total.join.plot.annual2$est_change_fleet
-total.join.plot.annual2$LABEL <- paste0("SPECIES")
-colnames(total.join.plot.annual2) <-  c("YEAR",  "psc_statusquo", "psc_change", "net_new_PSC","LABEL")
-total.join.plot.annual3 <- total.join.plot.annual2 %>% pivot_longer(
-  cols = c("net_new_PSC", "psc_statusquo"),
-  names_to = "psc_type",
-  names_prefix = "psc_",
-  values_to = "psc_amount",
-  values_drop_na = TRUE
-)
 
+# --- 12. Final Status Quo Comparison ---
 
-# #plot
-ggplot(total.join.plot.annual3, aes(x = YEAR, y = psc_amount, fill = psc_type))  + ggtitle(paste0(spp_title, ": ", title_name)) +
-  geom_bar(stat = "identity", position = "dodge") + theme_bw() + labs(x="Year", y="Estimated Annual PSC (# Fish)") +
-  scale_fill_brewer(palette = "Paired", name="Closure", labels=c(title_name, "Status Quo")) +
-  theme(plot.title = element_text(hjust = 0.5)) 
+# 1. Clean build of the annual comparison data
+total.join.plot.annual_clean <- all_psc_status_quo_annual %>%
+  left_join(total.join.plot.annual, by = "YEAR") %>%
+  rename(psc_statusquo = sum_psc_status_quo, 
+         psc_change = est_change_fleet) %>%
+  mutate(psc_change = replace_na(psc_change, 0),
+         net_new_PSC = psc_statusquo + psc_change) %>%
+  left_join(boot_annual_ci, by = "YEAR") %>%
+  # 2. THE VERTICAL FIX: 
+  # Calculate the distance from the bootstrap result to the bootstrap mean
+  # then apply THAT distance to your actual bar height (net_new_PSC)
+  mutate(
+    # Find the 'spread' of the bootstrap distribution
+    boot_mean = (upper_change + lower_change) / 2, # Using the mid-point of the bootstrap
+    half_width_lower = boot_mean - lower_change,
+    half_width_upper = upper_change - boot_mean,
+    
+    # Apply that spread relative to your ACTUAL bar height
+    ymin_val = net_new_PSC - half_width_lower,
+    ymax_val = net_new_PSC + half_width_upper
+  ) %>%
+  # 3. Pivot for ggplot
+  pivot_longer(
+    cols = c("net_new_PSC", "psc_statusquo"),
+    names_to = "psc_type",
+    values_to = "psc_amount"
+  ) %>%
+  mutate(
+    ymin = ifelse(psc_type == "net_new_PSC", ymin_val, NA),
+    ymax = ifelse(psc_type == "net_new_PSC", ymax_val, NA)
+  ) %>%
+  distinct()
+
+# 4. Final Plot with Fixed Alignment
+y_min <- min(total.join.plot.annual_clean$psc_amount, na.rm = TRUE) * 0.9
+
+ggplot(total.join.plot.annual_clean, aes(x = factor(YEAR), y = psc_amount, fill = psc_type)) + 
+  geom_bar(stat = "identity", position = position_dodge(0.9)) + 
+  geom_errorbar(aes(ymin = ymin, ymax = ymax), position = position_dodge(0.9), width = 0.25) +
+  # Apply the dynamic zoom
+  coord_cartesian(ylim = c(y_min, NA)) + 
+  theme_bw() + 
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) + 
+  labs(title = paste0(spp_title, ": ", title_name),
+       x = "Year", 
+       y = "Estimated Annual PSC (# Fish)") +
+  scale_fill_brewer(palette = "Paired", 
+                    name = "Scenario", 
+                    labels = c("Closure (with 95% CI)", "Status Quo")) +
+  theme(plot.title = element_text(hjust = 0.5))
 
 ```
 
-## 12. Final Summary Statistics Table
+## 13. Final Summary Statistics Table
 
 ```{r}
 #| label: final-table
 #| fig-width: 8
 #| fig-height: 5
 
-#final summary table
-final.summary.table <- total.join.plot.annual2 %>% dplyr::select(YEAR, psc_statusquo, net_new_PSC, psc_change)
+# Re-align with the original script's naming convention
+total.join.plot.annual2 <- all_psc_status_quo_annual %>%
+  left_join(total.join.plot.annual, by = "YEAR") %>%
+  rename(psc_statusquo = sum_psc_status_quo, 
+         psc_change = est_change_fleet) %>%
+  mutate(psc_change = replace_na(psc_change, 0),
+         net_new_PSC = psc_statusquo + psc_change) %>%
+  left_join(boot_annual_ci, by = "YEAR") %>%
+  # Add the CI bounds we calculated for the plot
+  mutate(
+    lower_diff = psc_change - lower_change,
+    upper_diff = upper_change - psc_change,
+    ymin_val = net_new_PSC - lower_diff,
+    ymax_val = net_new_PSC + upper_diff
+  )
+
+# Create the final summary table
+final.summary.table <- total.join.plot.annual2 %>% 
+  dplyr::select(YEAR, psc_statusquo, net_new_PSC, ymin_val, ymax_val, psc_change)
+
+# Format for the report
 final.summary.table <- as.data.frame(final.summary.table)
-colnames(final.summary.table) <- c("year", "PSC_status_quo", "PSC_closure", "Net_Change")
-final.summary.table$percent_change <- final.summary.table$Net_Change / final.summary.table$PSC_status_quo *100
-print(final.summary.table)
+colnames(final.summary.table) <- c("year", "PSC_status_quo", "PSC_closure", "lowerCI_closure", "upperCI_closure", "Net_Change")
+
+# Calculate percent change
+final.summary.table$percent_change <- (final.summary.table$Net_Change / final.summary.table$PSC_status_quo) * 100
+
+# Render as a professional HTML table for Quarto
+library(knitr)
+kable(final.summary.table, 
+      digits = 2, 
+      caption = "Annual PSC Comparison: Status Quo vs. Closure Scenarios")
 
 ```
