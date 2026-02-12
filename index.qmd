@@ -1,15 +1,9 @@
 ---
 title: "Proportional Fleet Redistribution"
-date: today
 format: 
   html:
-    theme: cosmo
     toc: true
     code-fold: true
-    embed-resources: false
-execute:
-  warning: false
-  message: false
 ---
 
 ## 1. Setup
