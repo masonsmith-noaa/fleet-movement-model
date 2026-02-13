@@ -1,5 +1,6 @@
 ---
-title: "Proportional Fleet Redistribution"
+title: "Proportional Groundfish Redistribution"
+date: today
 format: 
   html:
     theme: cosmo
@@ -138,14 +139,11 @@ for(i in simulated_years){
     # Generate Groundfish catch (kept consistent across all areas)
     wk_dat$GF_TOTAL_CATCH_MT <- round(rnorm(nrow(sim_areas), mean = 50, sd = 10), 2)
     
-    # Generate PSC catch with Bias:
-    wk_dat$PSC_TOTAL_COUNT <- NA # Initialize
+    # Higher PSC mean for inside areas 
+    wk_dat$PSC_TOTAL_COUNT[is_inside] <- round(rnorm(num_inside, mean = 20, sd = 3), 2)
     
-    # Higher PSC mean for inside areas (e.g., mean = 15)
-    wk_dat$PSC_TOTAL_COUNT[is_inside] <- round(rnorm(num_inside, mean = 10, sd = 3), 2)
-    
-    # Lower PSC mean for outside areas (e.g., mean = 5)
-    wk_dat$PSC_TOTAL_COUNT[!is_inside] <- round(rnorm(num_outside, mean = 5, sd = 2), 2)
+    # Lower PSC mean for outside areas
+    wk_dat$PSC_TOTAL_COUNT[!is_inside] <- rnbinom(num_outside, mu = 10, size = 2)
     
     year_weeks_list[[week_date]] <- wk_dat
   }
@@ -541,16 +539,17 @@ total.join.plot.annual_clean <- all_psc_status_quo_annual %>%
   ) %>%
   distinct()
 
-# 4. Final Plot with Fixed Alignment
-y_min <- min(total.join.plot.annual_clean$psc_amount, na.rm = TRUE) * 0.9
-
+# 4. Final Plot 
 ggplot(total.join.plot.annual_clean, aes(x = factor(YEAR), y = psc_amount, fill = psc_type)) + 
-  geom_bar(stat = "identity", position = position_dodge(0.9)) + 
-  geom_errorbar(aes(ymin = ymin, ymax = ymax), position = position_dodge(0.9), width = 0.25) +
-  # Apply the dynamic zoom
-  coord_cartesian(ylim = c(y_min, NA)) + 
-  theme_bw() + 
+  geom_bar(stat = "identity", 
+           position = position_dodge(width = 0.9)) + 
+  geom_errorbar(aes(ymin = ymin, ymax = ymax), 
+                position = position_dodge(width = 0.9), 
+                width = 0.25, 
+                na.rm = TRUE) +
+  # This ensures the bars start exactly at 0 and adds 15% space at the top for labels/CIs
   scale_y_continuous(expand = expansion(mult = c(0, 0.15))) + 
+  theme_bw() + 
   labs(title = paste0(spp_title, ": ", title_name),
        x = "Year", 
        y = "Estimated Annual PSC (# Fish)") +
