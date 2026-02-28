@@ -32,24 +32,27 @@ library(patchwork)
 library(ggpattern)
 library(data.table)
 library(sf)
+library(kableExtra)
 
 options(scipen=999)
 
 ```
 
+
+
+
 ## 2. Set Parameters
 
-Assign titles, timeframe, and closures
+Assign labels and timeframe
 
 ```{r}
 # Parameters
 spp_title = "Species"
 title_name = "Closure"
 timeframe <- c(2011:2023)
-closure.stat.areas <- c(665730, 665700, 655730, 655700)
 ```
 
-## 3. Spatial Data and Grid Setup
+## 3. Load Spatial Data
 
 Loading the Alaska background and statistical area shapefiles to create the time-series grid.
 
@@ -58,7 +61,7 @@ Loading the Alaska background and statistical area shapefiles to create the time
 # Note: Ensure these paths are relative to your .qmd file location
 AK <- terra::vect("shapefiles/mv_alaska_1mil_py.shp")
 stat_areas <- terra::vect("shapefiles/State_Stat_2004.shp")
-stat_areas$STAT_AREA <- as.numeric(stat_areas$STAT_AREA)
+
 
 # Create timeseries list
 stat.list <- list()
@@ -70,29 +73,26 @@ for (i in timeframe){
 stat.areas.timeseries <- terra::vect(stat.list)
 ```
 
-## 4. Closure Assignment
 
-Defining the closure area based on specific statistical areas.
+## 4. Load Catch Data
+
+This is where you load your catch data. For this example, we are simulating weekly catch data for 20 cells closest to a hypothetical closure area. Here, we're also simulating a bias of higher PSC inside the hypothetical closure.
 
 ```{r}
-#| label: closure-setup
+
+#| label: simulation
+
+
+# --- 5. Simulation Data (Biased for high PSC inside a closure) ---
+
+closure.stat.areas <- c(665730, 665700, 655730, 655700)
+
 closure <- subset(stat_areas, stat_areas$STAT_AREA %in% closure.stat.areas)
 closure$closed <- "yes"
 closure2 <- terra::aggregate(closure)
 
 non_closure <- stat_areas[!(stat_areas$STAT_AREA %in% closure.stat.areas), ]
 non_closure$closed <- "no"
-```
-
-## 5. Simulation Data
-
-Simulating weekly catch data for 20 cells closest to the closure area. This is where you would also enter your own catch data. Here, we're also simulating a bias of higher PSC inside the hypothetical closure.
-
-```{r}
-#| label: simulation
-
-
-# --- 5. Simulation Data (Biased for high PSC inside closure) ---
 
 set.seed(123)
 num_to_select <- 20
@@ -113,49 +113,112 @@ sim_areas <- rbind(sim_areas, closure)
 simulated_years <- c(2021, 2022, 2023)
 sim.list <- list()
 
-for(i in simulated_years){
+
+# Define the two scenarios
+species_configs <- list(
+  "Species_A" = list(inside_mu = 20, outside_mu = 10), # High inside
+  "Species_B" = list(inside_mu = 10, outside_mu = 15)  # High outside (The "Opposite")
+)
+
+all_species_list <- list()
+
+for(spp_name in names(species_configs)){
   
-  # Create a sequence of 5 weeks starting in August for each year
-  week_sequence <- seq.Date(from = as.Date(paste0(i, "-08-01")), 
-                            by = "week", length.out = 5)
-  year_weeks_list <- list()
+  conf <- species_configs[[spp_name]]
+  sim.list <- list()
   
-  for(week_date in as.character(week_sequence)) {
+  for(i in simulated_years){
+    week_sequence <- seq.Date(from = as.Date(paste0(i, "-08-01")), 
+                              by = "week", length.out = 5)
+    year_weeks_list <- list()
     
-    # Identify which rows are inside the closure for this specific loop
-    is_inside <- sim_areas$STAT_AREA %in% closure.stat.areas
-    num_inside <- sum(is_inside)
-    num_outside <- sum(!is_inside)
-    
-    # Create the data frame
-    wk_dat <- data.frame(
-      STAT_AREA = sim_areas$STAT_AREA,
-      YEAR = i,
-      WEEK_END_DATE = week_date,
-      CATCH_ACTIVITY_DATE = as.character(as.Date(week_date) - 2),
-      PROCESSING_SECTOR = "X"
-    )
-    
-    # Generate Groundfish catch (kept consistent across all areas)
-    wk_dat$GF_TOTAL_CATCH_MT <- round(rnorm(nrow(sim_areas), mean = 50, sd = 10), 2)
-    
-    # Higher PSC mean for inside areas 
-    wk_dat$PSC_TOTAL_COUNT[is_inside] <- round(rnorm(num_inside, mean = 20, sd = 3), 2)
-    
-    # Lower PSC mean for outside areas
-    wk_dat$PSC_TOTAL_COUNT[!is_inside] <- rnbinom(num_outside, mu = 10, size = 2)
-    
-    year_weeks_list[[week_date]] <- wk_dat
+    for(week_date in as.character(week_sequence)) {
+      is_inside <- sim_areas$STAT_AREA %in% closure.stat.areas
+      num_inside <- sum(is_inside)
+      num_outside <- sum(!is_inside)
+      
+      wk_dat <- data.frame(
+        STAT_AREA = sim_areas$STAT_AREA,
+        SPECIES = spp_name,  # Track which species this is
+        YEAR = i,
+        WEEK_END_DATE = week_date,
+        CATCH_ACTIVITY_DATE = as.character(as.Date(week_date) - 2),
+        PROCESSING_SECTOR = "X"
+      )
+      
+      wk_dat$GF_TOTAL_CATCH_MT <- round(rnorm(nrow(sim_areas), mean = 50, sd = 10), 2)
+      
+      # Apply the bias based on the species config
+      wk_dat$PSC_TOTAL_COUNT <- NA
+      # Inside Areas
+      wk_dat$PSC_TOTAL_COUNT[is_inside] <- round(rnorm(num_inside, mean = conf$inside_mu, sd = 3), 2)
+      # Outside Areas (Using rnorm for both to keep the 'opposite' effect clean)
+      wk_dat$PSC_TOTAL_COUNT[!is_inside] <- round(rnorm(num_outside, mean = conf$outside_mu, sd = 5), 2)
+      
+      year_weeks_list[[week_date]] <- wk_dat
+    }
+    sim.list[[as.character(i)]] <- do.call(rbind, year_weeks_list)
   }
-  sim.list[[as.character(i)]] <- do.call(rbind, year_weeks_list)
+  all_species_list[[spp_name]] <- do.call(rbind, sim.list)
 }
 
-catch_data <- do.call(rbind, sim.list)
+# Combine both species into one master dataframe
+catch_data_combined <- do.call(rbind, all_species_list)
 
-# 5. Merge catch data with spatvector
-# Using all.x = FALSE ensures the map only displays areas with data
-catch_data2 <- merge(stat_areas, catch_data, by = "STAT_AREA", all.x = FALSE)
+# Merge with SpatVector
+catch_data2 <- merge(stat_areas, catch_data_combined, by = "STAT_AREA", all.x = FALSE)
+
+
 ```
+
+## 5. Explore Bycatch Data
+In this example, the highest PSC rates of Species A are in areas 665730, 665700, 655730, 655700. However, these areas have the lowest PSC rates for Species B.
+```{r}
+#| label: fig-psc-catch
+#| fig-cap: "Simulated weekly PSC distributions."
+#| fig-width: 12
+#| fig-height: 8
+
+# This groups by STAT_AREA and calculates the mean of all other numeric columns
+catch_data_means <- st_as_sf(catch_data2)
+catch_data_means <- catch_data_means %>% dplyr::group_by(STAT_AREA, SPECIES) %>%
+  summarise(
+    mean_psc = mean(PSC_TOTAL_COUNT)
+  )
+catch_data_means2 <- terra::vect(catch_data_means)
+
+
+ggplot() +
+  tidyterra::geom_spatvector(data = catch_data_means2, aes(fill = mean_psc), 
+                             alpha = 0.8, col = NA, na.rm = TRUE) +
+  tidyterra::geom_spatvector_text(data = catch_data_means2, aes(label = STAT_AREA),
+                                  size = 2.5,       # Adjust size as needed
+                                  fontface = "bold", 
+                                  check_overlap = TRUE) + # Prevents messy overlapping text
+  scale_fill_distiller(palette = "RdYlBu", name = "Mean PSC Catch") +
+  theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank()) +
+  facet_wrap(~SPECIES)
+```
+
+## 5. Closure Assignment
+
+Defining the closure area based on the statistical areas to reduce bycatch of Species A (665730, 665700, 655730, 655700). We will later look at the trade-off with the closure's effect on Species B.
+
+```{r}
+#| label: closure-setup
+
+closure.stat.areas <- c(665730, 665700, 655730, 655700)
+
+closure <- subset(stat_areas, stat_areas$STAT_AREA %in% closure.stat.areas)
+closure$closed <- "yes"
+closure2 <- terra::aggregate(closure)
+
+non_closure <- stat_areas[!(stat_areas$STAT_AREA %in% closure.stat.areas), ]
+non_closure$closed <- "no"
+
+```
+
+
 
 ## 6. Visualizations
 
@@ -180,27 +243,34 @@ ggplot() +
 Weekly PSC catch - simulated to have higher PSC within the hypothetical closure.
 
 ```{r}
-#| label: fig-psc-catch
+#| label: fig-weekly-psc-catch
 #| fig-cap: "Simulated weekly PSC distributions."
 #| fig-width: 12
 #| fig-height: 8
 
 ggplot() +
-  tidyterra::geom_spatvector(data = catch_data2, aes(fill = PSC_TOTAL_COUNT), 
+  # Use subsetting [ ] to filter the SpatVector rows for Species_A
+  tidyterra::geom_spatvector(data = catch_data2[catch_data2$SPECIES == "Species_A", ], 
+                             aes(fill = PSC_TOTAL_COUNT), 
                              alpha = 0.8, col = NA, na.rm = TRUE) +
-  scale_fill_distiller(palette = "GnBu", name = "PSC Catch (Number)") +
+  
+  scale_fill_distiller(palette = "RdYlBu", name = "PSC Catch (Number)") +
+  
+  # Keep the closure overlay (this is independent of species)
   tidyterra::geom_spatvector(data = closure2, aes(color = "Closure"), 
                              fill = NA, alpha = 0.5, lwd = 0.5) +
+  
   scale_color_manual(values = c("Closure" = "red"), name = NULL) +
   facet_wrap(~WEEK_END_DATE, ncol=5) +
-  theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank())
+  theme_bw() + 
+  theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank())
 
 
 ```
 
 ## 7. Assign Closure Dates & Isolate Impacted Hauls
 
-For this exercise, July 1 chosen as the closure date for each year. For year-long closures, choose January 1.
+For this exercise, January 1 was chosen for a simple year-long closure. 
 
 ```{r}
 
@@ -209,32 +279,38 @@ For this exercise, July 1 chosen as the closure date for each year. For year-lon
 
 #sum status quo PSC by year for later joins
 all_psc_status_quo_annual <- as.data.frame(catch_data2) %>%
-  group_by(YEAR) %>%
+  group_by(YEAR, SPECIES) %>%
   reframe(
-    sum_psc_status_quo = sum(PSC_TOTAL_COUNT)
+    sum_psc_status_quo = sum(PSC_TOTAL_COUNT, na.rm = TRUE)
   )
-
 #assign dates to data ---
 #set closure date
 closure_dates <- data.frame(
   YEAR = c(2021,2022,2023),
   PROCESSING_SECTOR = "X",
-  closure_date = c('2021-07-01','2022-07-01', '2023-07-01')
+  closure_date = c('2021-01-01','2022-01-01', '2023-01-01')
 )
 
-#assign dates
-all_psc_closures_dates <- as.data.frame(dplyr::left_join(catch_data2, closure_dates, by=c("YEAR", "PROCESSING_SECTOR")))
+# 1. Join dates to the data
+all_psc_closures_dates <- as.data.frame(catch_data2) %>%
+  left_join(closure_dates, by = c("YEAR", "PROCESSING_SECTOR"))
 
+# 2. Assign impacts based on dates
+all_psc_closures_dates <- all_psc_closures_dates %>%
+  mutate(
+    # Ensure dates are actually Date objects for the comparison to work
+    CATCH_ACTIVITY_DATE = as.Date(CATCH_ACTIVITY_DATE),
+    closure_date = as.Date(closure_date),
+    
+    impacted = ifelse(CATCH_ACTIVITY_DATE > closure_date, "yes", "no"),
+    
+    # Calculate tonnage bins
+    tons_gf_after_closure = ifelse(impacted == "yes", GF_TOTAL_CATCH_MT, 0),
+    tons_gf_no_closure    = ifelse(impacted == "no" | is.na(impacted), GF_TOTAL_CATCH_MT, 0)
+  )
 
-#assign groundfish and psc based on date ---
-all_psc_closures_dates$closure <- ifelse(!is.na(all_psc_closures_dates$closure_date), "yes", "no")
-all_psc_closures_dates$impacted <- ifelse(all_psc_closures_dates$CATCH_ACTIVITY_DATE > all_psc_closures_dates$closure_date, "yes", "no")
-all_psc_closures_dates$tons_gf_after_closure <- ifelse(all_psc_closures_dates$impacted=="yes", all_psc_closures_dates$GF_TOTAL_CATCH_MT, 0)
-all_psc_closures_dates$tons_gf_no_closure <- ifelse(all_psc_closures_dates$impacted=="no" | is.na(all_psc_closures_dates$impacted), all_psc_closures_dates$GF_TOTAL_CATCH_MT, 0)
-
-
-#isolate impacted hauls
-all_psc_impacted <- subset(all_psc_closures_dates, impacted=="yes")
+# 3. Isolate impacted hauls (Keeping SPECIES column intact)
+all_psc_impacted <- subset(all_psc_closures_dates, impacted == "yes")
 
 ```
 
@@ -254,8 +330,7 @@ stat_areas_closed <- closure.stat.areas
 
 #identify which hauls occurred inside/outside the closed area
 all_psc_impacted_cluster <- all_psc_impacted %>%
-  mutate(inside = case_when(STAT_AREA %in% c(stat_areas_closed) ~ "yes", TRUE ~ NA_character_))
-all_psc_impacted_cluster$inside[is.na(all_psc_impacted_cluster$inside)] <- "no" # NA cpue to 0s
+  mutate(inside = ifelse(STAT_AREA %in% stat_areas_closed, "yes", "no"))
 
 
 # -- inside catch -- #
@@ -263,67 +338,45 @@ all_psc_impacted_cluster$inside[is.na(all_psc_impacted_cluster$inside)] <- "no" 
 gf_inside_cluster <- subset(all_psc_impacted_cluster, inside == "yes")
 
 #sum gf and psc inside closed area for later calcs
-gf_inside_cluster2 <- gf_inside_cluster %>%
-  group_by(YEAR, WEEK_END_DATE, PROCESSING_SECTOR) %>%
+gf_inside_summary <- all_psc_impacted_cluster %>%
+  filter(inside == "yes") %>%
+  group_by(SPECIES, YEAR, WEEK_END_DATE, PROCESSING_SECTOR) %>%
   summarise(
-    tons_gf_inside_wk = sum(GF_TOTAL_CATCH_MT),
-    psc_measure_inside_wk = sum(PSC_TOTAL_COUNT)
+    tons_gf_inside_wk = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
+    psc_measure_inside_wk = sum(PSC_TOTAL_COUNT, na.rm = TRUE),
+    .groups = "drop"
   )
-
-# -- outside catch -- #
-#isolate the hauls that occurred outside the closed area
-gf_outside_cluster <- subset(all_psc_impacted_cluster, inside == "no")
-
-gf_outside_cluster2 <- gf_outside_cluster %>%
-  group_by(YEAR, WEEK_END_DATE, PROCESSING_SECTOR) %>%
+# Calculate mean PSC rates per Stat Area (Outside only)
+sum.stat.timeseries.gf_all <- all_psc_impacted_cluster %>%
+  filter(inside == "no") %>%
+  group_by(SPECIES, YEAR, WEEK_END_DATE, STAT_AREA, PROCESSING_SECTOR) %>%
   summarise(
-    tons_gf_outside_wk = sum(GF_TOTAL_CATCH_MT),
-    psc_measure_outside_wk = sum(PSC_TOTAL_COUNT)
+    tons_gf_wk = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
+    mean_psc_wk = mean(PSC_TOTAL_COUNT, na.rm = TRUE),
+    mean_gf_tons_wk = mean(GF_TOTAL_CATCH_MT, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(mean_psc_rate_wk = mean_psc_wk / mean_gf_tons_wk)
+
+# Calculate total catch outside (denominator for proportions)
+gf.outside.total <- all_psc_impacted_cluster %>%
+  filter(inside == "no") %>%
+  group_by(SPECIES, YEAR, WEEK_END_DATE, PROCESSING_SECTOR) %>%
+  summarise(
+    tons_gf_outside_total = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
+    .groups = "drop"
   )
 
-
-# summarize mean psc rates and calculate ratio of means  ---
-
-sum.stat.timeseries.gf_all <- gf_outside_cluster %>%
-  group_by(YEAR, WEEK_END_DATE, STAT_AREA, PROCESSING_SECTOR) %>%
-  reframe(
-    tons_gf_wk = sum(GF_TOTAL_CATCH_MT),
-    mean_psc_wk = mean(PSC_TOTAL_COUNT),
-    mean_gf_tons_wk = mean(GF_TOTAL_CATCH_MT)) 
-
-#ratio
-sum.stat.timeseries.gf_all$mean_psc_rate_wk <- sum.stat.timeseries.gf_all$mean_psc_wk/sum.stat.timeseries.gf_all$mean_gf_tons_wk
-
-
-# Proportions by YEAR and STAT_AREA  ---
-
-#isolate gf catch by week
-gf.outside.stat <- gf_outside_cluster %>%
-  group_by(YEAR, WEEK_END_DATE, STAT_AREA, PROCESSING_SECTOR) %>%
-  reframe(
-    tons_gf_annual_stat = sum(GF_TOTAL_CATCH_MT)
-  )
-
-# sum all catch outside
-gf.outside.annually <- gf_outside_cluster %>%
-  group_by(YEAR, WEEK_END_DATE,  PROCESSING_SECTOR) %>%
-  reframe(
-    tons_gf_annual = sum(GF_TOTAL_CATCH_MT))
-
-#join the the sums back to main
-sum.stat.timeseries.gf_all2 <- dplyr::left_join(sum.stat.timeseries.gf_all, gf.outside.annually, by = c("YEAR", "WEEK_END_DATE", "PROCESSING_SECTOR"))
-sum.stat.timeseries.gf_all3 <- dplyr::left_join(sum.stat.timeseries.gf_all2, gf.outside.stat, by = c("YEAR","WEEK_END_DATE", "STAT_AREA", "PROCESSING_SECTOR"))
-
-# CALC PROPORTION OF OUTSIDE CATCH FOR EACH AREA
-sum.stat.timeseries.gf_all3$proportion_outside_wk <- sum.stat.timeseries.gf_all3$tons_gf_annual_stat/sum.stat.timeseries.gf_all3$tons_gf_annual
-sum.stat.timeseries.gf_all3 <- as.data.frame(sum.stat.timeseries.gf_all3)
-
+# Join and calculate the redistribution proportion
+sum.stat.timeseries.gf_all3 <- sum.stat.timeseries.gf_all %>%
+  left_join(gf.outside.total, by = c("SPECIES", "YEAR", "WEEK_END_DATE", "PROCESSING_SECTOR")) %>%
+  mutate(proportion_outside_wk = tons_gf_wk / tons_gf_outside_total)
 
 ```
 
 ## 9. Plot Weekly Proportions
 
-This plot shows the proportions of groundfish catch for the 20 adjacent stat areas outside of the closure. These proportions will be what displaced catch is applied to, under the assumption that the fishery will meet the same overall total catch.
+This plot shows the proportions of groundfish catch outside of the closure. These proportions will be what displaced catch is applied to, under the assumption that the fishery will meet the same overall total catch.
 
 ```{r}
 #| label: fig-props
@@ -356,47 +409,49 @@ ggplot() +
 #| label: summary-stats
 #| echo: false
 
-#join catch from inside area
-total.join <- dplyr::left_join(sum.stat.timeseries.gf_all3,
-                               gf_inside_cluster2 %>% dplyr::select(YEAR, WEEK_END_DATE, PROCESSING_SECTOR, tons_gf_inside_wk),
-                               by=c("YEAR", "WEEK_END_DATE",  "PROCESSING_SECTOR"))
+# Join catch from inside area (Matching by Species)
+total.join <- dplyr::left_join(
+    sum.stat.timeseries.gf_all3,
+    gf_inside_summary %>% dplyr::select(SPECIES, YEAR, WEEK_END_DATE, PROCESSING_SECTOR, tons_gf_inside_wk),
+    by = c("SPECIES", "YEAR", "WEEK_END_DATE", "PROCESSING_SECTOR")
+  ) %>%
+  mutate(
+    # NAs to 0s for weeks with no inside catch
+    tons_gf_inside_wk = tidyr::replace_na(tons_gf_inside_wk, 0),
+    # Multiply displaced catch by the outside proportions
+    displaced_gf_catch_wk = tons_gf_inside_wk * proportion_outside_wk,
+    # Calculate new PSC incurred in the new areas
+    new_PSC_wk = displaced_gf_catch_wk * mean_psc_rate_wk
+  )
 
-#NAs to 0s to remove weeks where no catch happened inside the closed area
-total.join$tons_gf_inside_wk[is.na(total.join$tons_gf_inside_wk)] <- 0
 
-#multiply weekly displaced catch by the outside proportions
-total.join$displaced_gf_catch_wk <- total.join$tons_gf_inside_wk * total.join$proportion_outside_wk
-
-#multiply PSC rate by new gf catch
-total.join$new_PSC_wk <- total.join$displaced_gf_catch_wk * total.join$mean_psc_rate_wk
-
-
-#summarize by week and sector
-total.join2 <- total.join %>% group_by(YEAR, WEEK_END_DATE, PROCESSING_SECTOR) %>%
-  reframe(
+total.join2 <- total.join %>% 
+  group_by(SPECIES, YEAR, WEEK_END_DATE, PROCESSING_SECTOR) %>%
+  summarise(
     tons_gf_inside_wk = max(tons_gf_inside_wk),
     displaced_gf_catch_wk = sum(displaced_gf_catch_wk),
     new_PSC_wk = sum(new_PSC_wk),
-    mean_psc_rate_wk = mean(mean_psc_rate_wk))
+    mean_psc_rate_wk = mean(mean_psc_rate_wk),
+    .groups = "drop"
+  )
 
-#join the status quo inside psc numbers
-total.join3 <- dplyr::left_join(total.join2,
-                                gf_inside_cluster2 %>% dplyr::select(YEAR, WEEK_END_DATE, PROCESSING_SECTOR, psc_measure_inside_wk),
-                                by=c("YEAR", "WEEK_END_DATE", "PROCESSING_SECTOR"))
-#NAs to 0s
-total.join3$psc_measure_inside_wk[is.na(total.join3$psc_measure_inside_wk)] <- 0
+# Join the status quo inside psc numbers (Matching by Species)
+total.join3 <- dplyr::left_join(
+    total.join2,
+    gf_inside_summary %>% dplyr::select(SPECIES, YEAR, WEEK_END_DATE, PROCESSING_SECTOR, psc_measure_inside_wk),
+    by = c("SPECIES", "YEAR", "WEEK_END_DATE", "PROCESSING_SECTOR")
+  ) %>%
+  mutate(
+    psc_measure_inside_wk = tidyr::replace_na(psc_measure_inside_wk, 0),
+    # The "Magic Number": New outside PSC minus what we saved inside
+    net_change_PSC_wk = new_PSC_wk - psc_measure_inside_wk
+  )
 
-#subtract the PSC caught inside the area
-total.join3$net_change_PSC_wk <- total.join3$new_PSC_wk - total.join3$psc_measure_inside_wk
-
-total.join.plot <- total.join3
-
-
-#sum est changes for annual numbers
-total.join.plot.annual <- total.join.plot %>%
-  group_by(YEAR) %>%
-  reframe(
-    est_change_fleet = sum(net_change_PSC_wk)
+total.join.plot.annual <- total.join3 %>%
+  group_by(SPECIES, YEAR) %>%
+  summarise(
+    est_change_fleet = sum(net_change_PSC_wk),
+    .groups = "drop"
   )
 
 ```
@@ -406,86 +461,95 @@ total.join.plot.annual <- total.join.plot %>%
 To provide a measure of uncertainty, we are bootstrapping 1,000 alternative scenarios by randomly shuffling the PSC rates where fishing is redistributed. We calculated a 95% Confidence Interval using the middle 95% of all simulated outcomes (between 2.5th and 97.5th percentiles).
 
 ```{r}
-# Create a base dataframe that keeps STAT_AREA for resampling
-df_bs_base <- total.join %>%
-  left_join(gf_inside_cluster2 %>% 
-              select(YEAR, WEEK_END_DATE, PROCESSING_SECTOR, psc_measure_inside_wk),
-            by = c("YEAR", "WEEK_END_DATE", "PROCESSING_SECTOR")) %>%
-  mutate(psc_measure_inside_wk = replace_na(psc_measure_inside_wk, 0),
-         displaced_gf_catch_wk = tons_gf_inside_wk * proportion_outside_wk)
 
+
+# 1. Create a base dataframe that keeps STAT_AREA and SPECIES for resampling
+df_bs_base <- total.join %>%
+  left_join(gf_inside_summary %>% 
+              select(SPECIES, YEAR, WEEK_END_DATE, PROCESSING_SECTOR, psc_measure_inside_wk),
+            by = c("SPECIES", "YEAR", "WEEK_END_DATE", "PROCESSING_SECTOR")) %>%
+  mutate(
+    psc_measure_inside_wk = replace_na(psc_measure_inside_wk, 0),
+    displaced_gf_catch_wk = tons_gf_inside_wk * proportion_outside_wk
+  )
+
+# 2. Set Bootstrap Parameters
 set.seed(345)
 n_iterations <- 1000
-weeks <- unique(df_bs_base$WEEK_END_DATE)
-boot_results <- matrix(NA, nrow = n_iterations, ncol = length(weeks))
-colnames(boot_results) <- weeks
+species_list <- unique(df_bs_base$SPECIES)
+all_species_boot_list <- list()
 
-for(i in 1:n_iterations) {
+# 3. Run Bootstrap Loop per Species
+for(spp in species_list) {
   
-  # Temporary storage for this iteration
-  new_psc_iteration <- numeric(nrow(df_bs_base))
+  # Filter base data for the specific species
+  df_spp <- df_bs_base %>% filter(SPECIES == spp)
+  weeks <- unique(df_spp$WEEK_END_DATE)
   
-  for(w in weeks) {
-    wk_indices <- which(df_bs_base$WEEK_END_DATE == w)
+  # Matrix to store results for this species (Rows = Iterations, Cols = Weeks)
+  spp_boot_results <- matrix(NA, nrow = n_iterations, ncol = length(weeks))
+  colnames(spp_boot_results) <- weeks
+  
+  for(i in 1:n_iterations) {
     
-    # THE FIX: Sample from the pool of all rates available this week
-    psc_pool <- df_bs_base$mean_psc_rate_wk[wk_indices]
+    # Temporary storage for new PSC calculations in this iteration
+    new_psc_iteration <- numeric(nrow(df_spp))
     
-    # Randomly assign a rate from the pool to each STAT_AREA
-    sampled_rates <- sample(psc_pool, size = length(wk_indices), replace = TRUE)
+    for(w in weeks) {
+      wk_indices <- which(df_spp$WEEK_END_DATE == w)
+      
+      # Sample from the pool of rates available for THIS species in THIS week
+      psc_pool <- df_spp$mean_psc_rate_wk[wk_indices]
+      
+      # Randomly assign a rate from the pool to each STAT_AREA
+      sampled_rates <- sample(psc_pool, size = length(wk_indices), replace = TRUE)
+      
+      # Calculate new PSC: (Fixed Displaced Catch) * (Randomly Sampled Rate)
+      new_psc_iteration[wk_indices] <- df_spp$displaced_gf_catch_wk[wk_indices] * sampled_rates
+    }
     
-    # Calculate new PSC: (Fixed Displaced Catch) * (Randomly Sampled Rate)
-    new_psc_iteration[wk_indices] <- df_bs_base$displaced_gf_catch_wk[wk_indices] * sampled_rates
+    # Summarize net change for this iteration
+    iter_summary <- df_spp %>%
+      mutate(new_psc_boot = new_psc_iteration) %>%
+      group_by(WEEK_END_DATE) %>%
+      summarise(
+        # New PSC total minus the status quo PSC that was avoided inside
+        net_change = sum(new_psc_boot) - max(psc_measure_inside_wk),
+        .groups = "drop"
+      )
+    
+    # Store iteration results in the matrix
+    for(j in seq_along(weeks)) {
+      spp_boot_results[i, j] <- iter_summary$net_change[iter_summary$WEEK_END_DATE == weeks[j]]
+    }
   }
   
-  # Summarize results for this iteration
-  df_iter <- df_bs_base
-  df_iter$new_psc_boot <- new_psc_iteration
-  
-  iter_summary <- df_iter %>%
-    group_by(WEEK_END_DATE) %>%
-    summarise(
-      net_change = sum(new_psc_boot) - max(psc_measure_inside_wk),
-      .groups = "drop"
-    )
-  
-  for(j in seq_along(weeks)) {
-    boot_results[i, j] <- iter_summary$net_change[iter_summary$WEEK_END_DATE == weeks[j]]
-  }
+  # Convert matrix to a long-format dataframe for this species
+  all_species_boot_list[[spp]] <- as.data.frame(spp_boot_results) %>%
+    mutate(iteration = 1:n(), SPECIES = spp) %>%
+    pivot_longer(-c(iteration, SPECIES), names_to = "WEEK_END_DATE", values_to = "net_change")
 }
 
-# 4. Calculate Confidence Intervals
-ci_summary <- data.frame(
-  WEEK_END_DATE = colnames(boot_results),
-  mean_net_change = colMeans(boot_results),
-  lower_ci = apply(boot_results, 2, quantile, probs = 0.025),
-  upper_ci = apply(boot_results, 2, quantile, probs = 0.975)
-)
+# 4. Combine all species and calculate Annual Confidence Intervals
+boot_long <- bind_rows(all_species_boot_list) %>%
+  mutate(
+    WEEK_END_DATE = as.Date(WEEK_END_DATE),
+    YEAR = lubridate::year(WEEK_END_DATE)
+  )
 
-# 5. Merge with original modeled data for comparison
-final_comparison <- left_join(ci_summary, total.join3 %>% 
-                                select(WEEK_END_DATE, net_change_PSC_wk), 
-                              by = "WEEK_END_DATE")
-
-#summarize bootstrap data into annual
-# Convert matrix to long dataframe to join with Year info
-boot_long <- as.data.frame(boot_results) %>%
-  mutate(iteration = 1:n()) %>%
-  pivot_longer(-iteration, names_to = "WEEK_END_DATE", values_to = "net_change") %>%
-  mutate(WEEK_END_DATE = as.Date(WEEK_END_DATE),
-         YEAR = lubridate::year(WEEK_END_DATE))
-
-# Sum by iteration and year to get annual distribution of change
+# Sum by iteration, species, and year to get annual distribution
 boot_annual_dist <- boot_long %>%
-  group_by(iteration, YEAR) %>%
+  group_by(iteration, SPECIES, YEAR) %>%
   summarise(annual_psc_change = sum(net_change), .groups = "drop")
 
-# Calculate CIs for the annual change
+# Calculate final CIs for the annual change
 boot_annual_ci <- boot_annual_dist %>%
-  group_by(YEAR) %>%
+  group_by(SPECIES, YEAR) %>%
   summarise(
+    mean_change = mean(annual_psc_change),
     lower_change = quantile(annual_psc_change, 0.025),
-    upper_change = quantile(annual_psc_change, 0.975)
+    upper_change = quantile(annual_psc_change, 0.975),
+    .groups = "drop"
   )
 
 
@@ -496,37 +560,35 @@ boot_annual_ci <- boot_annual_dist %>%
 
 
 
-## 12. Status Quo Comparison
+## 12. Compare to Status Quo
+In this example, we can confidently say that the closure may reduce bycatch of Species A, but with a trade-off of increased bycatch in Species B.
 
 ```{r}
 #| label: fig-status-quo
 #| fig-width: 8
 #| fig-height: 5
 
-
 # --- 12. Final Status Quo Comparison ---
 
-# 1. Clean build of the annual comparison data
+# 1. Clean build of the annual comparison data (Anchored by SPECIES)
 total.join.plot.annual_clean <- all_psc_status_quo_annual %>%
-  left_join(total.join.plot.annual, by = "YEAR") %>%
+  left_join(total.join.plot.annual, by = c("SPECIES", "YEAR")) %>%
   rename(psc_statusquo = sum_psc_status_quo, 
          psc_change = est_change_fleet) %>%
   mutate(psc_change = replace_na(psc_change, 0),
          net_new_PSC = psc_statusquo + psc_change) %>%
-  left_join(boot_annual_ci, by = "YEAR") %>%
-  # 2. THE VERTICAL FIX: 
-  # Calculate the distance from the bootstrap result to the bootstrap mean
-  # then apply THAT distance to your actual bar height (net_new_PSC)
+  # Join bootstrap CIs by SPECIES and YEAR
+  left_join(boot_annual_ci, by = c("SPECIES", "YEAR")) %>%
+  
+  # 2. THE VERTICAL FIX (Relative to net_new_PSC)
   mutate(
-    # Find the 'spread' of the bootstrap distribution
-    boot_mean = (upper_change + lower_change) / 2, # Using the mid-point of the bootstrap
-    half_width_lower = boot_mean - lower_change,
-    half_width_upper = upper_change - boot_mean,
+    half_width_lower = mean_change - lower_change,
+    half_width_upper = upper_change - mean_change,
     
-    # Apply that spread relative to your ACTUAL bar height
     ymin_val = net_new_PSC - half_width_lower,
     ymax_val = net_new_PSC + half_width_upper
   ) %>%
+  
   # 3. Pivot for ggplot
   pivot_longer(
     cols = c("net_new_PSC", "psc_statusquo"),
@@ -536,10 +598,9 @@ total.join.plot.annual_clean <- all_psc_status_quo_annual %>%
   mutate(
     ymin = ifelse(psc_type == "net_new_PSC", ymin_val, NA),
     ymax = ifelse(psc_type == "net_new_PSC", ymax_val, NA)
-  ) %>%
-  distinct()
+  )
 
-# 4. Final Plot 
+# 4. Final Plot with Faceting by Species
 ggplot(total.join.plot.annual_clean, aes(x = factor(YEAR), y = psc_amount, fill = psc_type)) + 
   geom_bar(stat = "identity", 
            position = position_dodge(width = 0.9)) + 
@@ -547,57 +608,68 @@ ggplot(total.join.plot.annual_clean, aes(x = factor(YEAR), y = psc_amount, fill 
                 position = position_dodge(width = 0.9), 
                 width = 0.25, 
                 na.rm = TRUE) +
-  # This ensures the bars start exactly at 0 and adds 15% space at the top for labels/CIs
+  # Add faceting so you see the "Opposite" effects side-by-side
+  facet_wrap(~SPECIES, scales = "free_y") + 
+  
   scale_y_continuous(expand = expansion(mult = c(0, 0.15))) + 
   theme_bw() + 
-  labs(title = paste0(spp_title, ": ", title_name),
+  labs(title = "Annual Impact Comparison: Scenario vs. Status Quo",
+       subtitle = "Error bars represent 95% Bootstrap Confidence Interval",
        x = "Year", 
        y = "Estimated Annual PSC (# Fish)") +
   scale_fill_brewer(palette = "Paired", 
                     name = "Scenario", 
-                    labels = c("Closure (with 95% CI)", "Status Quo")) +
-  theme(plot.title = element_text(hjust = 0.5))
+                    labels = c("Closure Scenario", "Status Quo")) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.position = "bottom")
 
 ```
 
-## 13. Final Summary Statistics Table
-
+## 13. Summary Statistics
+Based on the years explored, Species A may have had roughly 12-14% reductions in bycatch, at the expense of roughly 4-7% increases in bycatch of Species B.
 ```{r}
 #| label: final-table
 #| fig-width: 8
 #| fig-height: 5
 
-# Re-align with the original script's naming convention
+# --- 13. Final Summary Table ---
+
+# 1. Re-align with the species-aware naming convention
 total.join.plot.annual2 <- all_psc_status_quo_annual %>%
-  left_join(total.join.plot.annual, by = "YEAR") %>%
+  left_join(total.join.plot.annual, by = c("SPECIES", "YEAR")) %>%
   rename(psc_statusquo = sum_psc_status_quo, 
          psc_change = est_change_fleet) %>%
   mutate(psc_change = replace_na(psc_change, 0),
          net_new_PSC = psc_statusquo + psc_change) %>%
-  left_join(boot_annual_ci, by = "YEAR") %>%
-  # Add the CI bounds we calculated for the plot
+  left_join(boot_annual_ci, by = c("SPECIES", "YEAR")) %>%
+  # 2. Add the CI bounds calculated for the plot
   mutate(
-    lower_diff = psc_change - lower_change,
-    upper_diff = upper_change - psc_change,
-    ymin_val = net_new_PSC - lower_diff,
-    ymax_val = net_new_PSC + upper_diff
+    # Note: Using the bootstrap bounds directly for the table
+    lowerCI_closure = net_new_PSC - (mean_change - lower_change),
+    upperCI_closure = net_new_PSC + (upper_change - mean_change)
   )
 
-# Create the final summary table
+# 3. Create the final summary table
 final.summary.table <- total.join.plot.annual2 %>% 
-  dplyr::select(YEAR, psc_statusquo, net_new_PSC, ymin_val, ymax_val, psc_change)
+  dplyr::select(SPECIES, YEAR, psc_statusquo, net_new_PSC, lowerCI_closure, upperCI_closure, psc_change) %>%
+  mutate(percent_change = (psc_change / psc_statusquo) * 100) %>%
+  arrange(SPECIES, YEAR) # Group species together for the report
 
-# Format for the report
+# 4. Format for the report
 final.summary.table <- as.data.frame(final.summary.table)
-colnames(final.summary.table) <- c("year", "PSC_status_quo", "PSC_closure", "lowerCI_closure", "upperCI_closure", "Net_Change")
+colnames(final.summary.table) <- c("Species", "Year", "PSC_Status_Quo", "PSC_Closure", 
+                                   "Lower_CI", "Upper_CI", "Net_Change", "Percent_Change")
 
-# Calculate percent change
-final.summary.table$percent_change <- (final.summary.table$Net_Change / final.summary.table$PSC_status_quo) * 100
-
-# Render as a professional HTML table for Quarto
+# 5. Render as a professional HTML table for Quarto
 library(knitr)
+library(kableExtra) # Adding kableExtra for better species grouping visualization
+
 kable(final.summary.table, 
       digits = 2, 
-      caption = "Annual PSC Comparison: Status Quo vs. Closure Scenarios")
+      caption = "Annual PSC Comparison: Status Quo vs. Closure Scenarios by Species",
+      format = "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  collapse_rows(columns = 1, valign = "top") # Visually groups Species A and B rows
 
 ```
