@@ -1,5 +1,5 @@
 ---
-title: "Proportional Groundfish Redistribution"
+title: "Fleet Movement Model: A Proportional Redistribution Approach"
 date: today
 format: 
   html:
@@ -14,9 +14,9 @@ execute:
 
 ## 1. Setup
 
+This vignette evaluates the bycatch dynamics of two species under a hypothetical scenario displacing a fishery from a chosen area. All data is simulated to show process only. This is also where we load the background grid and any parameters such as timeframes. Here, we use a baseline grid of the state statistical areas used for commercial catch accounting in Alaska, and are going to simulate data to years 2021:2023. 
 ```{r}
 #| label: setup
-#| include: false
 
 # Load packages
 library(dplyr)
@@ -38,28 +38,11 @@ library(knitr)
 
 options(scipen=999)
 
-```
-
-
-
-
-## 2. Set Parameters
-
-Assign labels and timeframe
-
-```{r}
 # Parameters
 spp_title = "Species"
 title_name = "Closure"
-timeframe <- c(2011:2023)
-```
+timeframe <- c(2021:2023)
 
-## 3. Load Spatial Data
-
-Loading the Alaska background and statistical area shapefiles to create the time-series grid.
-
-```{r}
-#| label: load-spatial
 # Note: Ensure these paths are relative to your .qmd file location
 AK <- terra::vect("shapefiles/mv_alaska_1mil_py.shp")
 stat_areas <- terra::vect("shapefiles/State_Stat_2004.shp")
@@ -73,10 +56,11 @@ for (i in timeframe){
   stat.list[[as.character(i)]] <- stat_shape
 }
 stat.areas.timeseries <- terra::vect(stat.list)
+
 ```
 
 
-## 4. Load Catch Data
+## 2. Load Catch Data
 
 This is where you load your catch data ['catch_data']. For this example, we are simulating weekly catch data for 20 stat_areas closest to a hypothetical closure area. Here, we simulate two species (A and B), where Species A has a bias of higher PSC catch inside the area and Species B has a higher PSC catch outside the area.
 
@@ -173,13 +157,13 @@ catch_data <- merge(stat_areas, catch_data_combined, by = "STAT_AREA", all.x = F
 
 ```
 
-## 5. Explore Bycatch Data
+## 3. Explore Bycatch Data
 In this example, the average highest PSC catch of Species A are in areas 665730, 665700, 655730, 655700, while these areas have the lowest PSC catch for Species B.
 ```{r}
 #| label: fig-psc-catch
 #| fig-cap: "Simulated weekly PSC distributions."
 #| fig-width: 10
-#| fig-height: 10
+#| fig-height: 6
 
 # This groups by STAT_AREA and calculates the mean of all other numeric columns
 catch_data_means <- st_as_sf(catch_data)
@@ -202,7 +186,7 @@ ggplot() +
   facet_wrap(~SPECIES)
 ```
 
-## 6. Closure Assignment
+## 4. Closure Assignment
 
 Defining the closure area based on the statistical areas to reduce bycatch of Species A (665730, 665700, 655730, 655700). We will later look at the trade-off with the closure's effect on Species B.
 
@@ -220,7 +204,7 @@ non_closure$closed <- "no"
 
 ```
 
-## 7. Do we have the right area?
+## 5. Do we have the right area?
 
 The above method is a user-defined selection of stat_areas. We can also use a spatial optimization approach to allow the data to choose the stat_areas with the highest reduction in PSC. In this example, select the four adjacent stat_areas with the highest PSC catch. Because we use simulated data, this approach unsurprisingly gives us the same four areas for Species A as above.
 
@@ -317,7 +301,7 @@ cat(paste0("**Automated Selection:** ", winner_areas))
 ```
 
 
-## 8. Plot Weekly Groundfish and PSC Catch
+## 6. Plot Weekly Groundfish and PSC Catch
 
 Weekly groundfish catch - simulated to be randomly distributed across the study area (closure + 20 adjacent stat areas). These are used to calculate PSC rates per stat_area.
 
@@ -366,7 +350,7 @@ ggplot() +
 ```
 
 
-## 9. Assign Closure Dates & Isolate Impacted Hauls
+## 7. Assign Closure Dates & Isolate Impacted Hauls
 
 For this exercise, January 1 was chosen for a simple year-long closure. 
 
@@ -412,7 +396,7 @@ all_psc_impacted <- subset(all_psc_closures_dates, impacted == "yes")
 
 ```
 
-## 10. Calculate Catch and Proportions Inside/Outside Closure
+## 8. Calculate Catch and Proportions Inside/Outside Closure
 
 This step summarizes the data used in the main calculations - the proportions of outside groundish catch where displaced catch is applied to, under the assumption that the fishery will meet the same overall total catch, the total catch inside the closure to be applied to the proportions, the new PSC as a result of the new GF catch applied to local PSC rates, and the PSC caught inside the closure that will be subtracted from the net total.
 
@@ -472,7 +456,7 @@ sum.stat.timeseries.gf_all3 <- sum.stat.timeseries.gf_all %>%
 
 ```
 
-## 11. Plot Weekly Proportions
+## 9. Plot Weekly Proportions
 
 This plot shows the proportions of groundfish catch outside of the closure. These proportions will be what displaced catch is applied to, under the assumption that the fishery will meet the same overall total catch.
 
@@ -500,7 +484,7 @@ ggplot() +
 
 ```
 
-## 12. Calculate Weekly and Annual Summary Statistics
+## 10. Calculate Weekly and Annual Summary Statistics
 
 ```{r}
 
@@ -555,7 +539,7 @@ total.join.plot.annual <- total.join3 %>%
 ```
 
 
-## 13. Bootstrap
+## 11. Bootstrap
 To provide a measure of uncertainty, we are bootstrapping 1,000 alternative scenarios by randomly shuffling the PSC rates where fishing is redistributed. We calculated a 95% Confidence Interval using the middle 95% of all simulated outcomes (between 2.5th and 97.5th percentiles).
 
 ```{r}
@@ -654,7 +638,7 @@ boot_annual_ci <- boot_annual_dist %>%
 
 ```
 
-## 14. Compare to Status Quo
+## 12. Evaluate Impacts
 In this example, we can confidently say that the closure may reduce bycatch of Species A, but with a trade-off of increased bycatch in Species B.
 
 ```{r}
@@ -720,7 +704,7 @@ ggplot(total.join.plot.annual_clean, aes(x = factor(YEAR), y = psc_amount, fill 
 
 ```
 
-## 15. Summary Statistics
+## 13. Summary Statistics
 Based on the years explored, Species A may have had roughly 12-14% reductions in bycatch, at the expense of roughly 4-7% increases in bycatch of Species B.
 ```{r}
 #| label: final-table
