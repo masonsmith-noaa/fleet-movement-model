@@ -1,5 +1,5 @@
 ---
-title: "Fleet Movement Model: A Proportional Redistribution Approach"
+title: "Fleet Movement Model: A Proportional Redistribution Approach to Bycatch Evaluation"
 date: today
 format: 
   html:
