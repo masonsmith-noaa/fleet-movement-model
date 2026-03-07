@@ -14,7 +14,7 @@ execute:
 
 ## 1. Setup
 
-This vignette evaluates the bycatch dynamics of two species under a hypothetical scenario displacing a fishery from a chosen area. All data is simulated to show process only. This is also where we load the background grid and any parameters such as timeframes. Here, we use a baseline grid of the state statistical areas used for commercial catch accounting in Alaska, and are going to simulate data to years 2021:2023. 
+This vignette evaluates a simulated trade-off in bycatch effects under a hypothetical closure scenario. All data is simulated to show process only. This is also where we load the background grid and any parameters such as timeframes. Here, we use a baseline grid of the state statistical areas used for commercial catch accounting in Alaska, and are going to simulate data to years 2021:2023. 
 ```{r}
 #| label: setup
 
