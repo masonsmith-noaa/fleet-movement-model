@@ -2,3 +2,5 @@
 This repository provides the code to reproduce the fleet movement model. This model was built using the Alaska state statistical area grid, but cn be adapted to use any spatial grid of choosing.
 
 See vignette here: https://masonsmith-noaa.github.io/fleet-movement-model/
+
+See validation here: [https://masonsmith-noaa.github.io/fleet-movement-model/](https://masonsmith-noaa.github.io/fleet-movement-model/fmm_validation.html)
