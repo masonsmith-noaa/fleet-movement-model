@@ -1,0 +1,198 @@
+---
+title: "Interactive Proportional Groundfish Redistribution"
+author: "Mason Smith"
+format:
+  html:
+    resources: 
+      - shapefiles/
+    filters:
+      - shinylive
+---
+
+```{shinylive-r}
+#| standalone: true
+#| viewerHeight: 900
+
+library(shiny)
+library(dplyr)
+library(terra)
+library(ggplot2)
+library(lubridate)
+library(tidyr)
+library(units)
+library(tidyterra)
+library(patchwork)
+library(data.table)
+library(sf)
+
+options(scipen=999)
+
+# --- 1. DATA LOADING ---
+# Load base spatial data (Ensure shapefiles/ folder is in your repo)
+stat_areas <- terra::vect("shapefiles/State_Stat_2004.shp")
+stat_areas$STAT_AREA <- as.numeric(stat_areas$STAT_AREA)
+stat_areas$area_m2 <- terra::expanse(stat_areas)
+AK <- terra::vect("shapefiles/mv_alaska_1mil_py.shp")
+
+# --- 2. UI DEFINITION ---
+ui <- fluidPage(
+  titlePanel("Fleet Movement Model Dashboard"),
+  sidebarLayout(
+    sidebarPanel(
+      sliderInput("psc_bias", "PSC Hotspot Bias (Multiplier):", 
+                  min = 1, max = 5, value = 2, step = 0.5),
+      selectInput("closure_areas", "Select Closure Areas:",
+                  choices = sort(unique(stat_areas$STAT_AREA)),
+                  selected = c(665730, 665700, 655730, 655700),
+                  multiple = TRUE),
+      helpText("Adjust the slider to simulate higher PSC density inside the chosen areas.")
+    ),
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Weekly Catch Maps", plotOutput("gfPlot", height = "600px")),
+        tabPanel("Weekly PSC Maps", plotOutput("pscPlot", height = "600px")),
+        tabPanel("Annual Comparison", plotOutput("summaryPlot")),
+        tabPanel("Data Table", tableOutput("summaryTable"))
+      )
+    )
+  )
+)
+
+# --- 3. SERVER LOGIC ---
+server <- function(input, output, session) {
+  
+  analysis_results <- reactive({
+    req(input$closure_areas, input$psc_bias)
+    
+    current_closure_ids <- as.numeric(input$closure_areas)
+    bias_factor <- input$psc_bias
+    
+    # Geometry Logic
+    closure_poly <- subset(stat_areas, stat_areas$STAT_AREA %in% current_closure_ids)
+    closure_agg <- terra::aggregate(closure_poly)
+    non_closure <- stat_areas[!(stat_areas$STAT_AREA %in% current_closure_ids), ]
+    
+    dist_to_close <- terra::distance(non_closure, closure_agg)
+    non_closure$dist_to_closure <- apply(dist_to_close, 1, min)
+    sim_areas <- non_closure[order(non_closure$dist_to_closure), ] %>% 
+                   head(20) %>% 
+                   rbind(closure_poly)
+
+    # Simulation Logic
+    simulated_years <- c(2021, 2022, 2023)
+    sim_list <- list()
+    set.seed(123)
+    for(i in simulated_years){
+      week_seq <- seq.Date(from = as.Date(paste0(i, "-08-01")), by = "week", length.out = 5)
+      for(week_date in as.character(week_seq)) {
+        is_inside <- sim_areas$STAT_AREA %in% current_closure_ids
+        wk_dat <- data.frame(
+          STAT_AREA = sim_areas$STAT_AREA,
+          YEAR = i,
+          WEEK_END_DATE = week_date,
+          CATCH_ACTIVITY_DATE = as.character(as.Date(week_date) - 2),
+          PROCESSING_SECTOR = "X",
+          GF_TOTAL_CATCH_MT = round(rnorm(nrow(sim_areas), mean = 50, sd = 10), 2)
+        )
+        wk_dat$PSC_TOTAL_COUNT <- ifelse(is_inside,
+          round(rnorm(sum(is_inside), mean = 5 * bias_factor, sd = 2), 2),
+          round(rnorm(sum(!is_inside), mean = 5, sd = 2), 2)
+        )
+        sim_list[[paste0(i, week_date)]] <- wk_dat
+      }
+    }
+    
+    catch_data <- do.call(rbind, sim_list)
+    catch_data2 <- terra::merge(stat_areas, catch_data, by = "STAT_AREA", all.x = FALSE)
+
+    # Redistribution Math
+    closure_dates <- data.frame(
+      YEAR = c(2021, 2022, 2023),
+      PROCESSING_SECTOR = "X",
+      closure_date = c('2021-07-01','2022-07-01', '2023-07-01')
+    )
+
+    catch_df <- as.data.frame(catch_data2)
+    all_psc_dates <- catch_df %>%
+      left_join(closure_dates, by = c("YEAR", "PROCESSING_SECTOR")) %>%
+      mutate(
+        impacted = ifelse(CATCH_ACTIVITY_DATE > closure_date, "yes", "no"),
+        inside = ifelse(STAT_AREA %in% current_closure_ids, "yes", "no")
+      )
+    
+    impacted_hauls <- all_psc_dates %>% filter(impacted == "yes")
+    gf_inside <- impacted_hauls %>% filter(inside == "yes") %>%
+      group_by(YEAR, WEEK_END_DATE, PROCESSING_SECTOR) %>%
+      summarise(tons_gf_inside_wk = sum(GF_TOTAL_CATCH_MT), 
+                psc_inside_wk = sum(PSC_TOTAL_COUNT), .groups = "drop")
+
+    gf_outside <- impacted_hauls %>% filter(inside == "no")
+    rates_props <- gf_outside %>%
+      group_by(YEAR, WEEK_END_DATE, STAT_AREA, PROCESSING_SECTOR) %>%
+      summarise(tons_gf_wk = sum(GF_TOTAL_CATCH_MT),
+                mean_psc_rate_wk = sum(PSC_TOTAL_COUNT)/sum(GF_TOTAL_CATCH_MT), .groups = "drop") %>%
+      group_by(YEAR, WEEK_END_DATE, PROCESSING_SECTOR) %>%
+      mutate(prop_outside_wk = tons_gf_wk / sum(tons_gf_wk)) %>% ungroup()
+
+    net_change_calc <- rates_props %>%
+      left_join(gf_inside, by=c("YEAR", "WEEK_END_DATE", "PROCESSING_SECTOR")) %>%
+      mutate(new_PSC_wk = (tons_gf_inside_wk * prop_outside_wk) * mean_psc_rate_wk) %>%
+      group_by(YEAR) %>%
+      summarise(psc_change = sum(new_PSC_wk, na.rm=TRUE) - sum(psc_inside_wk, na.rm=TRUE), .groups = "drop")
+
+    status_quo_annual <- catch_df %>% 
+      group_by(YEAR) %>% 
+      summarise(psc_statusquo = sum(PSC_TOTAL_COUNT), .groups = "drop")
+    
+    final_summary <- status_quo_annual %>%
+      left_join(net_change_calc, by="YEAR") %>%
+      mutate(net_new_PSC = psc_statusquo + coalesce(psc_change, 0))
+
+    return(list(
+      catch_map = catch_data2,
+      closure_geom = closure_agg,
+      summary_df = final_summary
+    ))
+  })
+
+  output$gfPlot <- renderPlot({
+    res <- analysis_results()
+    ggplot() +
+      geom_spatvector(data = res$catch_map, aes(fill = GF_TOTAL_CATCH_MT), alpha = 0.8) +
+      scale_fill_distiller(palette = "GnBu", name = "Catch (MT)") +
+      geom_spatvector(data = res$closure_geom, color = "red", fill = NA, lwd = 1) +
+      facet_wrap(~WEEK_END_DATE, ncol = 5) +
+      theme_minimal()
+  })
+
+  output$pscPlot <- renderPlot({
+    res <- analysis_results()
+    ggplot() +
+      geom_spatvector(data = res$catch_map, aes(fill = PSC_TOTAL_COUNT), alpha = 0.8) +
+      scale_fill_distiller(palette = "Reds", name = "PSC Count") +
+      geom_spatvector(data = res$closure_geom, color = "black", fill = NA, lwd = 1) +
+      facet_wrap(~WEEK_END_DATE, ncol = 5) +
+      theme_minimal()
+  })
+
+  output$summaryPlot <- renderPlot({
+    res <- analysis_results()
+    plot_data <- res$summary_df %>% 
+      pivot_longer(cols = c("psc_statusquo", "net_new_PSC"), 
+                   names_to = "psc_type", values_to = "psc_amount")
+    
+    ggplot(plot_data, aes(x = factor(YEAR), y = psc_amount, fill = psc_type)) + 
+      geom_bar(stat = "identity", position = "dodge") +
+      scale_fill_manual(values = c("psc_statusquo" = "#1f78b4", "net_new_PSC" = "#a6cee3"),
+                        labels = c("Status Quo", "Closure Scenario"), name = "Scenario") +
+      labs(x = "Year", y = "Total PSC (# Fish)") +
+      theme_minimal()
+  })
+
+  output$summaryTable <- renderTable({
+    analysis_results()$summary_df
+  })
+}
+
+# --- 4. LAUNCH ---
+shinyApp(ui, server)
