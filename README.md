@@ -3,4 +3,4 @@ This repository provides the code to reproduce the fleet movement model. This mo
 
 See vignette here: https://masonsmith-noaa.github.io/fleet-movement-model/
 
-See validation here: [https://masonsmith-noaa.github.io/fleet-movement-model/](https://masonsmith-noaa.github.io/fleet-movement-model/fmm_validation.html)
+See validation here: https://masonsmith-noaa.github.io/fleet-movement-model/fmm_validation.html
