@@ -8,14 +8,21 @@ format:
     code-fold: true
     self-contained: true
 params:
-  time_step: "weekly" # Options: "weekly", "monthly", "annual"
+  time_step: "monthly" # Options: "weekly", "monthly", "annual"
   timeframe: [2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
   psc_spp: RKCR
   closure: rkcssa
-  buffer: 100000
+  buffer: 200000
+  gear: NPT
+  sector: CP
+  management_code: 
+  catch_type: GF_TOTAL_CATCH_MT   #GF_TOTAL_CATCH_MT, SHALLOW_FLATFISH_WEIGHT
+  lme: bs # (goa, ai, bs, or all)
+  method: both #options: m1, m2, both
 execute:
   warning: false
   message: false
+
 ---
 
 ## 1. Setup
@@ -24,9 +31,12 @@ This analysis predicts the spatial movement and net PSC change for displaced ves
 
 ```{r}
 #| label: setup
-
-#| label: setup
 #| include: false
+
+# Restrict multi-threading memory spikes in OpenBLAS
+Sys.setenv(OPENBLAS_NUM_THREADS = "1")
+Sys.setenv(OMP_NUM_THREADS = "1")
+Sys.setenv(MKL_NUM_THREADS = "1")
 
 # Load packages
 library(dplyr)
@@ -64,11 +74,13 @@ spp_title = case_when(
 
 
 title_name = case_when(
-      params$closure == "smihca"  ~ "Saint Matthews HCA",
-      params$closure == "nunivak"  ~ "Nunivak HCA",
-      params$closure == "rkcssa"  ~ "Red King Crab Sub Savings Area",
-      TRUE                          ~ NA # Default: NA string
-    )
+  params$closure == "smihca"         ~ "Saint Matthews HCA",
+  params$closure == "nunivak"        ~ "Nunivak HCA",
+  params$closure == "rkcssa"         ~ "Red King Crab Sub Savings Area",
+  params$closure == "Alt1El1Opt2_2025" ~ "GOA Custom Closure Area", # <--- ADD THIS
+  TRUE                               ~ NA_character_
+)
+
 
 ```
 
@@ -86,6 +98,23 @@ stat_areas <- terra::vect("shapefiles/State_Stat_2004.shp")
 # Ensure it stays a character string and strip any accidental whitespace
 stat_areas$STAT_AREA <- trimws(as.character(stat_areas$STAT_AREA))
 
+#filter to lme
+# Define NMFS reporting area vector dynamically
+target_areas <- switch(
+  tolower(params$lme),
+  "goa" = c(610, 620, 630, 640, 650, 649, 659),
+  "ai"  = c(541, 542, 543),
+  "bs"  = c(518, 519, 517, 513, 509, 516, 512, 508, 514, 400, 524, 521, 523, 550, 530),
+  "all" = c(610, 620, 630, 640, 650, 649, 659,
+            541, 542, 543,
+            518, 519, 517, 513, 509, 516, 512, 508, 514, 400, 524, 521, 523, 550, 530),
+  stop("Invalid params$lme value! Must be 'goa', 'ai', 'bs', or 'all'.")
+)
+
+# Then filter your stat_areas object cleanly
+stat_areas <- stat_areas %>%
+  dplyr::filter(GNMFSAREA %in% target_areas)
+
 # Create timeseries list
 stat.list <- list()
 for (i in params$timeframe){
@@ -100,7 +129,7 @@ stat.areas.timeseries <- terra::vect(stat.list)
 
 ## 4. Closure Assignment
 
-Define the closure area based on a polygon. This step uses an overlay threshold of 10% to determine if a closure includes a stat_area, rather than just touching it. This step also establishes the surrounding stat_areas to use for the analysis, based on a buffer parameter chosen (here, 100 km).
+Defining closure as any grid cell with 25% overlap of the polygon. This step also establishes the surrounding stat_areas to use for the analysis, based on a buffer parameter chosen (here, 200 km).
 
 ```{r}
 
@@ -108,7 +137,7 @@ Define the closure area based on a polygon. This step uses an overlay threshold 
 
 # 1. Load the polygons using terra
 closure_polygon       <- terra::vect(paste0("shapefiles/", params$closure, ".shp"))
-stat_areas_with_area  <- terra::vect("shapefiles/State_Stat_2004.shp") 
+stat_areas_with_area  <- stat_areas
 
 # Ensure character type right away and calculate individual cell base areas
 stat_areas_with_area$STAT_AREA <- trimws(as.character(stat_areas_with_area$STAT_AREA))
@@ -128,7 +157,7 @@ intersected_geometry$pct_of_cell_covered <- (intersected_geometry$overlap_area /
 
 # 5. Extract valid stat areas based on local coverage 
 # (Using 1.0% here catches any cell where the closure cuts through a meaningful chunk)
-threshold_pct       <- 10.0
+threshold_pct       <- 25.0
 valid_intersections <- as.data.frame(intersected_geometry) %>% 
   filter(pct_of_cell_covered > threshold_pct)
 
@@ -157,285 +186,681 @@ local_stat_matches <- terra::relate(stat_areas_with_area, closure_buffer, "inter
 local_stat_areas   <- stat_areas_with_area$STAT_AREA[as.vector(local_stat_matches)]
 
 # 7. Quick visual validation check
-plot(stat_areas_with_area[stat_areas_with_area$STAT_AREA %in% local_stat_areas, ], border="gray80")
-plot(closure, border = "blue", lwd = 2, add = TRUE)
-plot(closure_polygon, border = "red", lwd = 1.5, add = TRUE)
-plot(closure_buffer, border = "purple", lty = 2, lwd = 1.5, add = TRUE)
+
+# Subset local stat areas for plotting
+local_stats_spat <- stat_areas_with_area[stat_areas_with_area$STAT_AREA %in% local_stat_areas, ]
+
+ggplot() +
+  # 1. Base Stat Areas layer
+  tidyterra::geom_spatvector(
+    data = local_stats_spat, 
+    fill = NA, 
+    color = "gray80", 
+    lwd = 0.3
+  ) +
+  # 2. Closure layer (Blue)
+  tidyterra::geom_spatvector(
+    data = closure, 
+    aes(color = "Closure (Stat Area)"), 
+    fill = NA, 
+    lwd = 1.0
+  ) +
+  # 3. Closure Polygon layer (Red)
+  tidyterra::geom_spatvector(
+    data = closure_polygon, 
+    aes(color = "Closure Polygon"), 
+    fill = NA, 
+    lwd = 0.8
+  ) +
+  # 4. Closure Buffer layer (Purple Dashed)
+  tidyterra::geom_spatvector(
+    data = closure_buffer, 
+    aes(color = "Closure Buffer"), 
+    fill = NA, 
+    lwd = 0.8, 
+    linetype = "dotted"
+  ) +
+  # Manual Scale for Clean Legend Mapping
+  scale_color_manual(
+    name = "Spatial Layer",
+    values = c(
+      "Closure (Stat Area)"         = "blue",
+      "Closure Polygon" = "red",
+      "Closure Buffer"  = "purple"
+    )
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right",                       # Cleanly places legend on the right canvas margin
+    legend.background = element_rect(fill = "white", color = "gray80"),
+    axis.title = element_blank()
+  )
 
 ```
 
 ## 5. Catch Data
 
-Load catch data from the catch accounting system (CAS) and assign to stat_areas.
+Load catch data from the catch accounting system (CAS) and assign to stat_areas. Here we are defining groundfish as shallow flatfish (rock sole, yellowfin sole, butter sole, english sole, starry flounder, Alaska Plaice, sand sole) in the NPT Open Access fishery.
 
 ```{r}
-
+# ==============================================================================
+# SECTION 5: CATCH DATA LOAD & DOUBLE-SIDED 1%/99% OUTLIER CAPPING
+# ==============================================================================
 #| label: catch-data
 
-# 1. Read your pre-packaged standalone species file 
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(lubridate)
+  library(stringr)
+})
+
+# 1. Read standalone species file
 catch_data_raw <- read.csv(paste0("data/catch_data_", params$psc_spp, ".csv"), header = TRUE)
 colnames(catch_data_raw) <- toupper(colnames(catch_data_raw))
 
-# 2. Slice out data matching parameters and dynamically bin dates based on YAML parameter
-catch_data <- catch_data_raw %>%
+# Capture time step string for clean conditional evaluation
+time_step_mode <- params$time_step
+
+# 2. Slice out matching parameters and assign standardized TIME_STEP_KEY
+catch_data_filtered <- catch_data_raw %>%
   dplyr::filter(
     YEAR %in% params$timeframe,
-    SPECIES_GROUP_CODE == params$psc_spp,
-    PROCESSING_SECTOR == "CP"
+    SPECIES_GROUP_CODE == toupper(params$psc_spp),
+    AGENCY_GEAR_CODE == params$gear,
+    HARVEST_SECTOR == params$sector  # Dynamic Sector Filter
   ) %>%
-  mutate(
+  dplyr::mutate(
     STAT_AREA = stringr::str_pad(trimws(as.character(STAT_AREA)), width = 6, side = "left", pad = "0"),
     
-    # Force clean date classes
     CATCH_ACTIVITY_DATE = as.Date(CATCH_ACTIVITY_DATE),
     WEEK_END_DATE       = as.Date(WEEK_END_DATE),
     
-    # === THE DYNAMIC TIME-STEP SWITCH ===
-    # This assigns a universal grouping key based on what you chose at the top of the file
-    TIME_STEP_KEY = case_when(
-      params$time_step == "annual"  ~ as.character(YEAR),
-      params$time_step == "monthly" ~ format(CATCH_ACTIVITY_DATE, "%Y-%m"),
-      TRUE                          ~ as.character(WEEK_END_DATE) # Default: weekly string
-    )
+    # Modern conditional syntax (No deprecation warnings)
+    TIME_STEP_KEY = if (time_step_mode == "annual") {
+      "Full-Year"
+    } else if (time_step_mode == "monthly") {
+      sprintf("M%02d", lubridate::month(CATCH_ACTIVITY_DATE))
+    } else {
+      sprintf("W%02d", lubridate::isoweek(CATCH_ACTIVITY_DATE))
+    }
   )
 
-# 3. Collapse multiple daily entries into the chosen time step *before* doing spatial math
-# This prevents inflating weights when changing time horizons
-catch_data_binned <- catch_data %>%
-  group_by(YEAR, TIME_STEP_KEY, STAT_AREA, PROCESSING_SECTOR, SPECIES_GROUP_CODE) %>%
-  summarise(
-    # Aggregate to prevent duplicating values inside identical spatial blocks
-    GF_TOTAL_CATCH_MT = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
-    PSC_VALUE         = sum(PSC_VALUE, na.rm = TRUE),
+# 3. CALCULATE 1ST AND 99TH PERCENTILE THRESHOLDS
+gf_p01 <- quantile(catch_data_filtered$GF_TOTAL_CATCH_MT, 0.01, na.rm = TRUE)
+gf_p99 <- quantile(catch_data_filtered$GF_TOTAL_CATCH_MT, 0.99, na.rm = TRUE)
+
+psc_p01 <- quantile(catch_data_filtered$PSC_VALUE, 0.01, na.rm = TRUE)
+psc_p99 <- quantile(catch_data_filtered$PSC_VALUE, 0.99, na.rm = TRUE)
+
+# 4. CAP UPPER & LOWER 99% PERCENTILES (WINSORIZE GF AND PSC)
+catch_data <- catch_data_filtered %>%
+  dplyr::mutate(
+    # Cap GF Catch
+    GF_TOTAL_CATCH_MT = pmax(gf_p01, pmin(GF_TOTAL_CATCH_MT, gf_p99)),
     
-    # Pass a single baseline date along for Section 7's closure timeline comparison
+    # Cap PSC Catch
+    PSC_VALUE         = pmax(psc_p01, pmin(PSC_VALUE, psc_p99))
+  )
+
+# 5. Collapse daily entries while preserving NA_real_ for unobserved effort
+catch_data_binned <- catch_data %>%
+  dplyr::group_by(YEAR, TIME_STEP_KEY, STAT_AREA, HARVEST_SECTOR, SPECIES_GROUP_CODE) %>%
+  dplyr::summarise(
+    GF_TOTAL_CATCH_MT   = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
+    PSC_VALUE           = sum(PSC_VALUE, na.rm = TRUE),
+    EFFORT_MINUTES      = ifelse(all(is.na(EFFORT_MINUTES)), NA_real_, sum(EFFORT_MINUTES, na.rm = TRUE)),
     CATCH_ACTIVITY_DATE = min(CATCH_ACTIVITY_DATE),
     .groups = "drop"
   )
 
-# 4. Align the master spatial object and merge
+# 6. Align spatial object and merge
 stat_areas_with_area$STAT_AREA <- stringr::str_pad(trimws(as.character(stat_areas_with_area$STAT_AREA)), width = 6, side = "left", pad = "0")
 
-# Merge catch data with spatial dataframe
 catch_data_full <- merge(stat_areas_with_area, catch_data_binned, by = "STAT_AREA", all.x = FALSE)
-
-# Subset master catch data strictly to your 100km buffer zone
-catch_data2 <- subset(catch_data_full, catch_data_full$STAT_AREA %in% local_stat_areas)
+catch_data2     <- subset(catch_data_full, catch_data_full$STAT_AREA %in% local_stat_areas)
 
 ```
 
-## 6. Visualizations
+## 6. Inspect effort and catch
 
-Example of weekly groundfish catch.
-
+Groundfish catch (shallow flatfish) across months have plenty of activity inside and outside of the proposed area. You can also already see a high degree of temporal autocorrelation from one month-year to the next.
 ```{r}
 
 #| label: fig-gf-catch
-#| fig-cap: "Simulated weekly groundfish catch distributions."
+#| fig-cap: "Groundfish catch distributions."
 #| fig-width: 12
-#| fig-height: 8
+#| fig-height: 8.5
+
 ggplot() +
-  tidyterra::geom_spatvector(data = subset(catch_data2, catch_data2$YEAR==2018), aes(fill = GF_TOTAL_CATCH_MT), 
+  tidyterra::geom_spatvector(data = subset(catch_data2, catch_data2$YEAR %in% 2014:2020), aes(fill = GF_TOTAL_CATCH_MT), 
                              alpha = 0.8, col = NA, na.rm = TRUE) +
-  scale_fill_distiller(palette = "GnBu", name = "Catch (MT)") +
+  scale_fill_distiller(palette = "GnBu", name = "GF (mt)") +
   tidyterra::geom_spatvector(data = closure2, aes(color = "Closure"), 
                              fill = NA, alpha = 0.5, lwd = 0.5) +
   scale_color_manual(values = c("Closure" = "red"), name = NULL) +
-  facet_wrap(~TIME_STEP_KEY, ncol=10) +
-  theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank())
+ facet_grid(
+    YEAR~TIME_STEP_KEY,
+    switch = "y" # Optional: moves month labels to left margin for cleaner reading
+  ) +
+  theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank()) +
+  theme(
+    axis.title = element_blank(),
+    axis.text  = element_blank(),
+    axis.ticks = element_blank()
+  )
 
 ```
 
-Example of weekly PSC catch.
-
+PSC across months have plenty of activity inside and outside of the proposed area.
 ```{r}
 
 #| label: fig-psc-catch
-#| fig-cap: "Simulated weekly PSC distributions."
+#| fig-cap: "PSC catch distributions."
 #| fig-width: 12
-#| fig-height: 8
+#| fig-height: 8.5
 
 ggplot() +
-  tidyterra::geom_spatvector(data = subset(catch_data2, catch_data2$YEAR==2018), aes(fill = PSC_VALUE), 
+  tidyterra::geom_spatvector(data = subset(catch_data2, catch_data2$YEAR %in% 2014:2020), aes(fill = PSC_VALUE), 
                              alpha = 0.8, col = NA, na.rm = TRUE) +
-  scale_fill_distiller(palette = "GnBu", name = "PSC Catch (Number)") +
+  scale_fill_distiller(palette = "GnBu", name = paste0(spp_title, " PSC (num)")) +
   tidyterra::geom_spatvector(data = closure2, aes(color = "Closure"), 
                              fill = NA, alpha = 0.5, lwd = 0.5) +
   scale_color_manual(values = c("Closure" = "red"), name = NULL) +
-  facet_wrap(~TIME_STEP_KEY, ncol=10) +
-  theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank())
+ facet_grid(
+    YEAR~TIME_STEP_KEY,
+    switch = "y" # Optional: moves month labels to left margin for cleaner reading
+  ) +
+  theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank()) +
+  theme(
+    axis.title = element_blank(),
+    axis.text  = element_blank(),
+    axis.ticks = element_blank()
+  )
+
+```
+The effort data is limited due to the partial observer coverage of these CVs, so we're going to just run method 1.
+```{r}
+
+#| label: fig-gf-effort
+#| fig-cap: "Groundfish Effort distributions."
+#| fig-width: 12
+#| fig-height: 8.5
+
+ggplot() +
+  tidyterra::geom_spatvector(data = subset(catch_data2, catch_data2$YEAR %in% 2014:2020), aes(fill = EFFORT_MINUTES), 
+                             alpha = 0.8, col = NA, na.rm = TRUE) +
+  scale_fill_distiller(palette = "GnBu", name = "Effort (min") +
+  tidyterra::geom_spatvector(data = closure2, aes(color = "Closure"), 
+                             fill = NA, alpha = 0.5, lwd = 0.5) +
+  scale_color_manual(values = c("Closure" = "red"), name = NULL) +
+ facet_grid(
+    YEAR~TIME_STEP_KEY,
+    switch = "y" # Optional: moves month labels to left margin for cleaner reading
+  ) +
+  theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank()) +
+  theme(
+    axis.title = element_blank(),
+    axis.text  = element_blank(),
+    axis.ticks = element_blank()
+  )
+
+```
+## 7. Inspect the temporal autocorrelation assumption
+
+As a whole, the monthly NPT OA shallow flatfish fishery has a high temporal autocorrelation from one year to the next. You can also see this pretty clearly in the groundfish catch distributions above. 
+```{r}
+
+#| label: fig-global-ar1
+#| fig-cap: "Global temporal autocorrelation in groundfish catch."
+#| fig-width: 12
+#| fig-height: 8.5
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(scales)
+  library(patchwork)
+})
+
+# ==============================================================================
+# 1. COMPUTE DERIVED PROPORTIONS AND RATES
+# ==============================================================================
+df_primitives_clean <- catch_data_binned %>%
+  dplyr::filter(
+    YEAR != 2020,
+    STAT_AREA %in% local_stat_areas
+  ) %>%
+  as.data.frame()
+
+# Calculate cell-level rates and regional proportions
+df_derived_rates <- df_primitives_clean %>%
+  # Sum regional totals per year and sector for proportion calculation
+  dplyr::group_by(YEAR, HARVEST_SECTOR) %>%
+  dplyr::mutate(regional_gf_total = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE)) %>%
+  dplyr::ungroup() %>%
+  dplyr::group_by(YEAR, STAT_AREA, HARVEST_SECTOR) %>%
+  dplyr::summarise(
+    # 1. Spatial Redistribution Share (Cell MT / Regional Total MT)
+    gf_prop = ifelse(first(regional_gf_total) > 0, 
+                     sum(GF_TOTAL_CATCH_MT, na.rm = TRUE) / first(regional_gf_total), 0),
+    
+    # 2. Method 1 Bycatch Rate (PSC Count / Groundfish MT)
+    psc_rate_mt = ifelse(sum(GF_TOTAL_CATCH_MT, na.rm = TRUE) > 0, 
+                         sum(PSC_VALUE, na.rm = TRUE) / sum(GF_TOTAL_CATCH_MT, na.rm = TRUE), 0),
+    
+    # 3. Method 2 CPUE (Groundfish MT / Effort Minutes)
+    cpue_mt_min = ifelse(sum(EFFORT_MINUTES, na.rm = TRUE) > 0, 
+                         sum(GF_TOTAL_CATCH_MT, na.rm = TRUE) / sum(EFFORT_MINUTES, na.rm = TRUE), 0),
+    .groups = "drop"
+  )
+
+# ==============================================================================
+# 2. MATCH LAGGED (t-1) VS ACTUAL (t) PARAMETERS
+# ==============================================================================
+rates_lagged <- df_derived_rates %>%
+  dplyr::rename(
+    prop_prior = gf_prop,
+    rate_prior = psc_rate_mt,
+    cpue_prior = cpue_mt_min
+  ) %>%
+  dplyr::mutate(VALIDATION_YEAR_MATCH = YEAR + 1)
+
+rates_actual <- df_derived_rates %>%
+  dplyr::rename(
+    prop_actual = gf_prop,
+    rate_actual = psc_rate_mt,
+    cpue_actual = cpue_mt_min
+  )
+
+global_rates_panel <- rates_actual %>%
+  dplyr::inner_join(
+    rates_lagged,
+    by = c("YEAR" = "VALIDATION_YEAR_MATCH", "STAT_AREA", "HARVEST_SECTOR")
+  )
+
+# ==============================================================================
+# 3. HELPER PLOTTING FUNCTION FOR SINGLE GLOBAL SCATTER
+# ==============================================================================
+make_rate_scatter_global <- function(df, x_var, y_var, title_text, x_lab, y_lab) {
+  
+  # Calculate overall global correlations across all years
+  r_val   <- suppressWarnings(cor(df[[x_var]], df[[y_var]], use = "complete.obs", method = "pearson"))
+  rho_val <- suppressWarnings(cor(df[[x_var]], df[[y_var]], use = "complete.obs", method = "spearman"))
+  
+  label_text <- sprintf("Global r = %.2f\nGlobal rho = %.2f", 
+                        ifelse(is.na(r_val), 0, r_val), 
+                        ifelse(is.na(rho_val), 0, rho_val))
+  
+  # Set text position dynamically at 90% Y max and min X
+  x_pos <- min(df[[x_var]], na.rm = TRUE)
+  y_pos <- max(df[[y_var]], na.rm = TRUE) * 0.90
+
+  ggplot(df, aes(x = .data[[x_var]], y = .data[[y_var]])) +
+    geom_point(aes(color = HARVEST_SECTOR), size = 2, alpha = 0.6) +
+    geom_smooth(method = "lm", se = TRUE, color = "black", linetype = "solid", linewidth = 0.8) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+    annotate(
+      "text",
+      x = x_pos, y = y_pos, label = label_text,
+      hjust = 0, fontface = "bold", size = 3.5, color = "navy"
+    ) +
+    scale_x_continuous(labels = scales::comma) +
+    scale_y_continuous(labels = scales::comma) +
+    scale_color_manual(values = c("CP" = "#377eb8", "CV" = "#e41a1c")) +
+    theme_bw() +
+    labs(
+      title = title_text,
+      x = x_lab,
+      y = y_lab,
+      color = "Sector"
+    ) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 11),
+      axis.title = element_text(size = 9.5),
+      panel.grid.minor = element_blank()
+    )
+}
+
+# ==============================================================================
+# 4. GENERATE THE GLOBAL SCATTER PLOT
+# ==============================================================================
+p1 <- make_rate_scatter_global(
+  global_rates_panel, "prop_prior", "prop_actual",
+  "GF Spatial Redistribution Share", "Prior Share (t-1)", "Actual Share (t)"
+)
+
+# Display single plot with title annotation
+combined_rates_panel <- p1 +
+  plot_annotation(
+    title = paste0("Derived Parameter Autocorrelation Validation: ", title_name),
+    subtitle = "Cell-Level Rates & Spatial Allocations: Year t-1 vs Year t (All Years Combined)",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+      plot.subtitle = element_text(face = "italic", size = 10, hjust = 0.5)
+    )
+  ) & 
+  theme(legend.position = "bottom")
+
+# Display panel
+print(combined_rates_panel)
 
 ```
 
+By year, the monthly NPT OA shallow flatfish fishery has a very high temporal autocorrelation from one year to the next.
+```{r}
 
+#| label: fig-global-ar1
+#| fig-cap: "Annual temporal autocorrelation in groundfish spatial catch distribution."
+#| fig-width: 10
+#| fig-height: 10
 
-## 7. Assign Closure Dates & Isolate Impacted Hauls
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(scales)
+})
 
-For full-year closures, January 1 was chosen.
+# ==============================================================================
+# 1. COMPUTE DERIVED GROUNDFISH SPATIAL PROPORTIONS
+# ==============================================================================
+df_primitives_clean <- catch_data_binned %>%
+  dplyr::filter(
+    YEAR != 2020,
+    STAT_AREA %in% local_stat_areas,
+    HARVEST_SECTOR == params$sector # Dynamic sector binding
+  ) %>%
+  as.data.frame()
+
+# Calculate cell-level groundfish redistribution proportions
+df_derived_rates <- df_primitives_clean %>%
+  dplyr::group_by(YEAR, HARVEST_SECTOR) %>%
+  dplyr::mutate(regional_gf_total = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE)) %>%
+  dplyr::ungroup() %>%
+  dplyr::group_by(YEAR, STAT_AREA, HARVEST_SECTOR) %>%
+  dplyr::summarise(
+    # Spatial Redistribution Share (Cell MT / Regional Total MT)
+    gf_prop = ifelse(first(regional_gf_total) > 0, 
+                     sum(GF_TOTAL_CATCH_MT, na.rm = TRUE) / first(regional_gf_total), 0),
+    .groups = "drop"
+  )
+
+# ==============================================================================
+# 2. MATCH LAGGED (t-1) VS ACTUAL (t) PROPORTIONS
+# ==============================================================================
+rates_lagged <- df_derived_rates %>%
+  dplyr::rename(prop_prior = gf_prop) %>%
+  dplyr::mutate(VALIDATION_YEAR_MATCH = YEAR + 1)
+
+rates_actual <- df_derived_rates %>%
+  dplyr::rename(prop_actual = gf_prop)
+
+global_rates_panel <- rates_actual %>%
+  dplyr::inner_join(
+    rates_lagged,
+    by = c("YEAR" = "VALIDATION_YEAR_MATCH", "STAT_AREA", "HARVEST_SECTOR")
+  )
+
+# ==============================================================================
+# 3. COMPUTE YEAR-BY-YEAR CORRELATIONS
+# ==============================================================================
+annual_corrs_rates <- global_rates_panel %>%
+  dplyr::group_by(YEAR) %>%
+  dplyr::summarise(
+    prop_r   = suppressWarnings(cor(prop_prior, prop_actual, use = "complete.obs", method = "pearson")),
+    prop_rho = suppressWarnings(cor(prop_prior, prop_actual, use = "complete.obs", method = "spearman")),
+    .groups = "drop"
+  )
+
+global_rates_panel <- global_rates_panel %>%
+  dplyr::left_join(annual_corrs_rates, by = "YEAR")
+
+# ==============================================================================
+# 4. PLOT CLEAN FACETED SCATTER (SQUARE PANELS & ANCHORED LABELS)
+# ==============================================================================
+max_y_limit <- max(global_rates_panel$prop_actual, na.rm = TRUE) * 1.05
+
+labels_df <- global_rates_panel %>%
+  dplyr::group_by(YEAR) %>%
+  dplyr::summarise(
+    r_val   = first(prop_r),
+    rho_val = first(prop_rho),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    label_text = sprintf("r = %.2f\n\u03c1 = %.2f", 
+                         ifelse(is.na(r_val), 0, r_val), 
+                         ifelse(is.na(rho_val), 0, rho_val))
+  )
+
+ggplot(global_rates_panel, aes(x = prop_prior, y = prop_actual)) +
+  geom_point(aes(color = HARVEST_SECTOR), size = 2, alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linetype = "solid", linewidth = 0.8) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  
+  # ANCHOR TEXT AT TOP-LEFT ABOVE DATA CLUSTER
+  geom_text(
+    data = labels_df,
+    aes(x = 0.01, y = max_y_limit * 0.88, label = label_text),
+    hjust = 0, vjust = 1, fontface = "bold", size = 3.2, color = "navy"
+  ) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, max_y_limit)) +
+  scale_color_manual(values = c("CP" = "#377eb8", "CV" = "#e41a1c")) +
+  theme_bw() +
+  labs(
+    title = paste0("Annual Autocorrelation Validation: ", title_name),
+    subtitle = "Groundfish Spatial Redistribution Share: Year t-1 vs Year t",
+    x = "Prior Share (t-1)",
+    y = "Actual Share (t)",
+    color = "Sector"
+  ) +
+  theme(
+    plot.title       = element_text(face = "bold", hjust = 0.5, size = 12),
+    plot.subtitle    = element_text(face = "italic", hjust = 0.5, size = 10),
+    axis.title       = element_text(size = 9.5),
+    legend.position  = "bottom",
+    panel.grid.minor = element_blank(),
+    
+    # FORCES SQUARE FACET PANELS & SPACING
+    aspect.ratio     = 1,
+    panel.spacing    = unit(0.6, "lines")
+  ) + 
+  facet_wrap(~YEAR, ncol = 5)
+
+```
+## 8. Assign Closure Dates & Isolate Impacted Hauls
 
 ```{r}
 
 #| label: impacted-hauls
 #| echo: false
 
-#sum status quo PSC by year for later joins
+# 1. Sum status quo PSC by year for baseline reality joins
 all_psc_status_quo_annual <- as.data.frame(catch_data2) %>%
-  group_by(YEAR) %>%
-  reframe(
-    sum_psc_status_quo = sum(PSC_VALUE)
+  dplyr::group_by(YEAR) %>%
+  dplyr::reframe(
+    sum_psc_status_quo = sum(PSC_VALUE, na.rm = TRUE)
   )
 
-#assign dates to data ---
-# Automatically generate January 1st for every year in your global parameter timeline
+# 2. Assign closure dates matching your global parameter timeline
 closure_dates <- data.frame(
   YEAR = params$timeframe,
-  closure_date = paste0(params$timeframe, "-01-01")
+  closure_date = as.Date(paste0(params$timeframe, "-01-01"))
 )
 
-# Ensure the new column is explicitly treated as a clean Date class
-closure_dates$closure_date <- as.Date(closure_dates$closure_date)
+all_psc_closures_dates <- as.data.frame(dplyr::left_join(catch_data2, closure_dates, by = "YEAR"))
 
-#assign dates (Joined strictly by YEAR so it applies to all processing sectors)
-all_psc_closures_dates <- as.data.frame(dplyr::left_join(catch_data2, closure_dates, by=c("YEAR")))
-
-
-#assign groundfish and psc based on date ---
-all_psc_closures_dates$closure <- ifelse(!is.na(all_psc_closures_dates$closure_date), "yes", "no")
+# Flag closure presence and catch activity dates
+all_psc_closures_dates$closure  <- ifelse(!is.na(all_psc_closures_dates$closure_date), "yes", "no")
 all_psc_closures_dates$impacted <- ifelse(all_psc_closures_dates$CATCH_ACTIVITY_DATE >= all_psc_closures_dates$closure_date, "yes", "no")
-all_psc_closures_dates$tons_gf_after_closure <- ifelse(all_psc_closures_dates$impacted=="yes", all_psc_closures_dates$GF_TOTAL_CATCH_MT, 0)
-all_psc_closures_dates$tons_gf_no_closure <- ifelse(all_psc_closures_dates$impacted=="no" | is.na(all_psc_closures_dates$impacted), all_psc_closures_dates$GF_TOTAL_CATCH_MT, 0)
 
+all_psc_closures_dates$tons_gf_after_closure <- ifelse(all_psc_closures_dates$impacted == "yes", all_psc_closures_dates$GF_TOTAL_CATCH_MT, 0)
+all_psc_closures_dates$tons_gf_no_closure    <- ifelse(all_psc_closures_dates$impacted == "no" | is.na(all_psc_closures_dates$impacted), all_psc_closures_dates$GF_TOTAL_CATCH_MT, 0)
 
-#isolate impacted hauls
-all_psc_impacted <- subset(all_psc_closures_dates, impacted=="yes")
+# Isolate impacted hauls
+all_psc_impacted <- subset(all_psc_closures_dates, impacted == "yes")
 
-# ==============================================================================
-# Final Ledger Prep: Create ledger_df_clean for validation blocks
-# ==============================================================================
-
+# 3. Clean Ledger Prep for validation blocks
 ledger_df_clean <- as.data.frame(all_psc_closures_dates) %>%
   dplyr::mutate(
-    # Ensure spatial codes are clean 6-character strings
     STAT_AREA = stringr::str_pad(trimws(as.character(STAT_AREA)), width = 6, side = "left", pad = "0"),
-    # Identify if a row belongs inside the active regulatory box
     inside    = ifelse(STAT_AREA %in% closure.stat.areas, "yes", "no")
   ) %>%
-  # Restrict evaluation strictly to your 100km buffer footprint outside the closure
   dplyr::filter(STAT_AREA %in% local_stat_areas, inside == "no")
+
+# 4. Prepare total.join.plot.annual2 as the baseline reality bridge
+total.join.plot.annual2 <- all_psc_status_quo_annual %>%
+  dplyr::mutate(
+    psc_statusquo   = sum_psc_status_quo,
+    psc_change_m1   = 0,
+    psc_change_m2   = 0,
+    net_new_PSC_m1  = sum_psc_status_quo,
+    net_new_PSC_m2  = sum_psc_status_quo,
+    LABEL           = "SPECIES"
+  ) %>%
+  dplyr::select(YEAR, psc_statusquo, psc_change_m1, psc_change_m2, net_new_PSC_m1, net_new_PSC_m2, LABEL)
 
 ```
 
-## 8. Calculate Catch and Proportions Inside/Outside Closure
+# RETROSPECTIVE "WHAT-IF" SCENARIO
+This scenario runs the condition of "what if a closure had occurred" at the given year and time step given. In this example, minor differences in Tanner crab PSC were estimated under a closure, ranging from a 5.7% increase to a 43.2% decrease, but with high uncertainty around those estimates. 
+
+## 9. Calculate Catch and Proportions Inside/Outside Closure
 
 This step summarizes the data used in the main calculations - the proportions of outside groundish catch where displaced catch is applied to, under the assumption that the fishery will meet the same overall total catch, the total catch inside the closure to be applied to the proportions, the new PSC as a result of the new GF catch applied to local PSC rates, and the PSC caught inside the closure that will be subtracted from the net total.
 
 ```{r}
 
-#| label: rates-props
+#| label: rates-props-5yr-cpue
 #| echo: false
 
-# Identify Inside/Outside after a closure would have occurred  ---
-
-# Ensure your closed area matching vector is treated as clean characters
 stat_areas_closed <- as.character(closure.stat.areas) 
 
-# Identify which hauls occurred inside/outside the closed area
 all_psc_impacted_cluster <- all_psc_impacted %>%
-  # Safe character-to-character array matching
-  mutate(inside = case_when(trimws(as.character(STAT_AREA)) %in% stat_areas_closed ~ "yes", TRUE ~ NA_character_))
+  mutate(inside = case_when(trimws(as.character(STAT_AREA)) %in% stat_areas_closed ~ "yes", TRUE ~ "no"))
 
-all_psc_impacted_cluster$inside[is.na(all_psc_impacted_cluster$inside)] <- "no" 
-
-
-# -- inside catch -- #
-gf_inside_cluster <- subset(all_psc_impacted_cluster, inside == "yes")
-
-gf_inside_cluster2 <- gf_inside_cluster %>%
-  group_by(YEAR, TIME_STEP_KEY, PROCESSING_SECTOR) %>%
-  summarise(
-    tons_gf_inside_wk = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
+# --- STEP A: INSIDE CATCH SUMMARY ---
+gf_inside_cluster2 <- all_psc_impacted_cluster %>%
+  dplyr::filter(inside == "yes") %>%
+  dplyr::group_by(YEAR, TIME_STEP_KEY, HARVEST_SECTOR) %>%
+  dplyr::summarise(
+    tons_gf_inside_wk     = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
     psc_measure_inside_wk = sum(PSC_VALUE, na.rm = TRUE),
+    effort_inside_wk      = sum(EFFORT_MINUTES, na.rm = TRUE), 
     .groups = "drop"
   )
 
-# -- outside catch -- #
-gf_outside_cluster <- subset(all_psc_impacted_cluster, inside == "no")
+# --- STEP B: OUTSIDE PERFORMANCE MATRIX ---
+gf_outside_cluster <- all_psc_impacted_cluster %>%
+  filter(inside == "no") %>%
+  mutate(DYNAMIC_SEASONAL_KEY = TIME_STEP_KEY) # Standardized key reuse!
 
-gf_outside_cluster2 <- gf_outside_cluster %>%
-  group_by(YEAR, TIME_STEP_KEY, PROCESSING_SECTOR) %>%
+# 1. 5-YEAR ROLLING MEAN CPUE
+annual_spatial_footprint <- gf_outside_cluster %>%
+  group_by(YEAR, DYNAMIC_SEASONAL_KEY, STAT_AREA, HARVEST_SECTOR) %>%
   summarise(
-    tons_gf_outside_wk = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
-    psc_measure_outside_wk = sum(PSC_VALUE, na.rm = TRUE),
+    outside_gf_tons     = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
+    outside_effort_mins = sum(EFFORT_MINUTES, na.rm = TRUE),
     .groups = "drop"
   )
 
+rolling_cpue_list <- list()
+all_years_present <- sort(unique(annual_spatial_footprint$YEAR))
 
-# summarize mean psc rates and calculate ratio of means  ---
-sum.stat.timeseries.gf_all <- gf_outside_cluster %>%
-  group_by(YEAR, TIME_STEP_KEY, STAT_AREA, PROCESSING_SECTOR) %>%
-  reframe(
-    tons_gf_wk = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
-    mean_psc_wk = mean(PSC_VALUE, na.rm = TRUE),
-    mean_gf_tons_wk = mean(GF_TOTAL_CATCH_MT, na.rm = TRUE)) 
+for(target_yr in all_years_present) {
+  window_start <- target_yr - 1
+  window_end   <- target_yr - 1
+  
+  rolling_slice <- annual_spatial_footprint %>%
+    dplyr::filter(YEAR >= window_start & YEAR <= window_end) %>%
+    dplyr::group_by(DYNAMIC_SEASONAL_KEY, STAT_AREA, HARVEST_SECTOR) %>%
+    dplyr::summarise(
+      sum_tons_5yr   = sum(outside_gf_tons, na.rm = TRUE),
+      sum_effort_5yr = sum(outside_effort_mins, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      hist_gf_cpue_seasonal = ifelse(sum_effort_5yr > 0, sum_tons_5yr / sum_effort_5yr, 0),
+      YEAR = target_yr
+    ) %>%
+    dplyr::select(YEAR, DYNAMIC_SEASONAL_KEY, STAT_AREA, HARVEST_SECTOR, hist_gf_cpue_seasonal)
+  
+  rolling_cpue_list[[as.character(target_yr)]] <- rolling_slice
+}
 
-sum.stat.timeseries.gf_all$mean_psc_rate_wk <- ifelse(
-  sum.stat.timeseries.gf_all$mean_gf_tons_wk > 0,
-  sum.stat.timeseries.gf_all$mean_psc_wk / sum.stat.timeseries.gf_all$mean_gf_tons_wk,
-  0
-)
+historical_cpue_profile <- do.call(rbind, rolling_cpue_list)
 
+# 2. ACTIVE BASELINE MATRIX
+weekly_base_metrics <- gf_outside_cluster %>%
+  group_by(YEAR, TIME_STEP_KEY, DYNAMIC_SEASONAL_KEY, STAT_AREA, HARVEST_SECTOR) %>%
+  summarise(
+    tons_gf_wk           = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
+    total_effort_minutes = sum(EFFORT_MINUTES, na.rm = TRUE),
+    total_psc_count      = sum(PSC_VALUE, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    mean_psc_rate_wk         = ifelse(tons_gf_wk > 0, total_psc_count / tons_gf_wk, 0),
+    mean_psc_rate_minutes_wk = ifelse(total_effort_minutes > 0, total_psc_count / total_effort_minutes, 0),
+    active_gf_cpue_wk        = ifelse(total_effort_minutes > 0, tons_gf_wk / total_effort_minutes, 0)
+  ) %>%
+  left_join(
+    gf_outside_cluster %>%
+      group_by(YEAR, TIME_STEP_KEY, HARVEST_SECTOR) %>%
+      summarise(
+        tons_gf_annual      = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
+        effort_annual_total = sum(EFFORT_MINUTES, na.rm = TRUE),
+        .groups = "drop"
+      ),
+    by = c("YEAR", "TIME_STEP_KEY", "HARVEST_SECTOR")
+  ) %>%
+  left_join(
+    gf_outside_cluster %>%
+      group_by(YEAR, TIME_STEP_KEY, STAT_AREA, HARVEST_SECTOR) %>%
+      summarise(
+        tons_gf_annual_stat   = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
+        effort_annual_stat    = sum(EFFORT_MINUTES, na.rm = TRUE),
+        .groups = "drop"
+      ),
+    by = c("YEAR", "TIME_STEP_KEY", "STAT_AREA", "HARVEST_SECTOR")
+  ) %>%
+  mutate(
+    proportion_outside_wk        = ifelse(tons_gf_annual > 0, tons_gf_annual_stat / tons_gf_annual, 0),
+    proportion_outside_effort_wk = ifelse(effort_annual_total > 0, effort_annual_stat / effort_annual_total, 0),
+    area_cpue                     = ifelse(effort_annual_stat > 0, tons_gf_annual_stat / effort_annual_stat, 0)
+  ) %>%
+  left_join(
+    gf_outside_cluster %>%
+      group_by(YEAR, TIME_STEP_KEY, STAT_AREA, HARVEST_SECTOR) %>%
+      summarise(
+        stat_tons = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
+        stat_eff  = sum(EFFORT_MINUTES, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(stat_cpue = ifelse(stat_eff > 0, stat_tons / stat_eff, 0)) %>%
+      group_by(YEAR, TIME_STEP_KEY, HARVEST_SECTOR) %>%
+      summarise(total_outside_cpue_sum = sum(stat_cpue, na.rm = TRUE), .groups = "drop"),
+    by = c("YEAR", "TIME_STEP_KEY", "HARVEST_SECTOR")
+  ) %>%
+  mutate(
+    proportion_outside_cpue_wk = ifelse(total_outside_cpue_sum > 0, area_cpue / total_outside_cpue_sum, 0)
+  ) %>%
+  select(-area_cpue, -total_outside_cpue_sum)
 
-# Proportions by YEAR and STAT_AREA  ---
-gf.outside.stat <- gf_outside_cluster %>%
-  group_by(YEAR, TIME_STEP_KEY, STAT_AREA, PROCESSING_SECTOR) %>%
-  reframe(tons_gf_annual_stat = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE))
-
-gf.outside.annually <- gf_outside_cluster %>%
-  group_by(YEAR, TIME_STEP_KEY, PROCESSING_SECTOR) %>%
-  reframe(tons_gf_annual = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE))
-
-sum.stat.timeseries.gf_all2 <- dplyr::left_join(sum.stat.timeseries.gf_all, gf.outside.annually, by = c("YEAR", "TIME_STEP_KEY", "PROCESSING_SECTOR"))
-sum.stat.timeseries.gf_all3 <- dplyr::left_join(sum.stat.timeseries.gf_all2, gf.outside.stat, by = c("YEAR","TIME_STEP_KEY", "STAT_AREA", "PROCESSING_SECTOR"))
-
-sum.stat.timeseries.gf_all3$proportion_outside_wk <- ifelse(
-  sum.stat.timeseries.gf_all3$tons_gf_annual > 0,
-  sum.stat.timeseries.gf_all3$tons_gf_annual_stat / sum.stat.timeseries.gf_all3$tons_gf_annual,
-  0
-)
-
-sum.stat.timeseries.gf_all3 <- as.data.frame(sum.stat.timeseries.gf_all3)
+# 3. JOIN 5-YEAR CPUE
+sum.stat.timeseries.gf_all3 <- weekly_base_metrics %>%
+  left_join(
+    historical_cpue_profile,
+    by = c("YEAR", "DYNAMIC_SEASONAL_KEY", "STAT_AREA", "HARVEST_SECTOR")
+  ) %>%
+  mutate(
+    hist_gf_cpue_seasonal = ifelse(!is.na(hist_gf_cpue_seasonal), hist_gf_cpue_seasonal, active_gf_cpue_wk)
+  ) %>%
+  as.data.frame()
 
 ```
 
-## 9. Plot Weekly Proportions
-
-This plot shows the proportions of groundfish catch in the stat areas outside of the closure within the buffer. These proportions will be what displaced catch is applied to, under the assumption that the fishery will meet the same overall total catch.
-
-```{r}
-
-#| label: fig-props
-#| fig-cap: "Observed groundfish redistribution allocation proportions."
-#| fig-width: 12
-#| fig-height: 8
-
-# Proportion join
-sum.stat.timeseries.gf_all_shp <- dplyr::left_join(stat.areas.timeseries, sum.stat.timeseries.gf_all3, by=c("YEAR", "STAT_AREA"))
-sum.stat.timeseries.gf_all_shp <- terra::na.omit(sum.stat.timeseries.gf_all_shp, "PROCESSING_SECTOR")
-
-propdat <- sum.stat.timeseries.gf_all_shp
-propdat$label <- round(propdat$proportion_outside_wk, 2)
-
-ggplot() +
-  tidyterra::geom_spatvector(data=subset(propdat, propdat$YEAR==2015, propdat$proportion_outside_wk>0), aes(fill=proportion_outside_wk), alpha = 0.8, col=NA, na.rm=TRUE) +
-  scale_fill_distiller(palette = "GnBu", name = "Proportion of GF Catch") +
-  tidyterra::geom_spatvector(data = closure2, aes(color = "Closure"), 
-                             fill = NA, alpha = 0.5, lwd = 0.6) +
-  scale_color_manual(values = c("Closure" = "red"), name = NULL) +
-  facet_wrap(~TIME_STEP_KEY, ncol=10) +
-  theme_bw() + 
-  theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank())
-
-```
 
 ## 10. Calculate Weekly and Annual Summary Statistics
 
@@ -443,56 +868,55 @@ This step applies the displacement and new PSC calculations.
 
 ```{r}
 
-#| label: summary-stats
-#| echo: false
-
-# Join catch from inside area
-total.join <- dplyr::left_join(sum.stat.timeseries.gf_all3,
-                               gf_inside_cluster2 %>% dplyr::select(YEAR, TIME_STEP_KEY, PROCESSING_SECTOR, tons_gf_inside_wk),
-                               by=c("YEAR", "TIME_STEP_KEY",  "PROCESSING_SECTOR"))
-
-# NAs to 0s to remove weeks where no catch happened inside the closed area
-total.join$tons_gf_inside_wk[is.na(total.join$tons_gf_inside_wk)] <- 0
-
-# Multiply weekly displaced catch by the outside proportions
-total.join$displaced_gf_catch_wk <- total.join$tons_gf_inside_wk * total.join$proportion_outside_wk
-
-# Multiply PSC rate by new gf catch
-total.join$new_PSC_wk <- total.join$displaced_gf_catch_wk * total.join$mean_psc_rate_wk
-
-
-# Summarize by week and sector
-# Note: sum(unique(...)) prevents multi-sector records from over-inflating the baseline displacement total
-total.join2 <- total.join %>% 
-  group_by(YEAR, TIME_STEP_KEY, PROCESSING_SECTOR) %>%
-  reframe(
-    tons_gf_inside_wk = sum(unique(tons_gf_inside_wk)), 
-    displaced_gf_catch_wk = sum(displaced_gf_catch_wk),
-    new_PSC_wk = sum(new_PSC_wk),
-    mean_psc_rate_wk = mean(mean_psc_rate_wk))
-
-# Join the status quo inside psc numbers
-total.join3 <- dplyr::left_join(total.join2,
-                                gf_inside_cluster2 %>% dplyr::select(YEAR, TIME_STEP_KEY, PROCESSING_SECTOR, psc_measure_inside_wk),
-                                by=c("YEAR", "TIME_STEP_KEY", "PROCESSING_SECTOR"))
-# NAs to 0s
-total.join3$psc_measure_inside_wk[is.na(total.join3$psc_measure_inside_wk)] <- 0
-
-# Subtract the PSC caught inside the area
-total.join3$net_change_PSC_wk <- total.join3$new_PSC_wk - total.join3$psc_measure_inside_wk
-
-total.join.plot <- total.join3
-
-
-# Sum est changes for annual numbers
-total.join.plot.annual <- total.join.plot %>%
-  group_by(YEAR) %>%
-  reframe(
-    est_change_fleet = sum(net_change_PSC_wk)
+# --- SECTION 10: CORE PIPELINE ---
+total.join.master <- sum.stat.timeseries.gf_all3 %>%
+  left_join(
+    gf_inside_cluster2 %>% select(YEAR, TIME_STEP_KEY, HARVEST_SECTOR, tons_gf_inside_wk),
+    by = c("YEAR", "TIME_STEP_KEY", "HARVEST_SECTOR")
+  ) %>%
+  mutate(
+    tons_gf_inside_wk = replace_na(tons_gf_inside_wk, 0),
+    
+    # Shared Retrospective Catch Allocation
+    gf_catch_new = tons_gf_inside_wk * proportion_outside_wk,
+    
+    # Method 1: Volume Track (Real-Time Catch * Real-Time Bycatch-Per-Ton)
+    new_PSC_method1 = gf_catch_new * mean_psc_rate_wk,
+    
+    # Method 2: Effort Track (Shared Tonnage / 1-Yr Lagged CPUE * Real-Time Bycatch-Per-Minute)
+    effort_minutes_needed = ifelse(hist_gf_cpue_seasonal > 0, gf_catch_new / hist_gf_cpue_seasonal, 0),
+    new_PSC_method2       = effort_minutes_needed * mean_psc_rate_minutes_wk
   )
 
-```
+# Roll up to the annual summary as standard
+ledger_weekly <- total.join.master %>%
+  group_by(YEAR, TIME_STEP_KEY, HARVEST_SECTOR) %>%
+  summarise(
+    new_PSC_m1_wk = sum(new_PSC_method1, na.rm = TRUE),
+    new_PSC_m2_wk = sum(new_PSC_method2, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    gf_inside_cluster2 %>% select(YEAR, TIME_STEP_KEY, HARVEST_SECTOR, psc_measure_inside_wk),
+    by = c("YEAR", "TIME_STEP_KEY", "HARVEST_SECTOR")
+  ) %>%
+  mutate(
+    psc_measure_inside_wk = replace_na(psc_measure_inside_wk, 0),
+    net_change_m1_wk = new_PSC_m1_wk - psc_measure_inside_wk,
+    net_change_m2_wk = new_PSC_m2_wk - psc_measure_inside_wk
+  )
 
+total.join.plot.annual <- ledger_weekly %>%
+  group_by(YEAR) %>%
+  summarise(
+    est_change_method1 = sum(net_change_m1_wk, na.rm = TRUE),
+    est_change_method2 = sum(net_change_m2_wk, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+total.join = total.join.master
+
+```
 
 ## 11. Bootstrap
 
@@ -501,150 +925,245 @@ To provide a measure of uncertainty, we are bootstrapping 1,000 alternative scen
 ```{r}
 
 # ==============================================================================
-# SPATIAL BYCATCH RATE BOOTSTRAP 
+# ## 11. Bootstrap (ROW-PRESERVING COUPLED RESAMPLER)
 # ==============================================================================
 #| label: spatial-rate-bootstrap
 
 set.seed(345)
 n_iterations <- 1000
-time_steps   <- unique(total.join$TIME_STEP_KEY)
 
-# Matrix to store results (Rows = Iterations, Cols = Time Steps)
-boot_matrix <- matrix(NA, nrow = n_iterations, ncol = length(time_steps))
-colnames(boot_matrix) <- time_steps
-
-# FIX: Explicitly pull psc_measure_inside_wk from gf_inside_cluster2 during setup
 df_bs_base <- total.join %>%
   dplyr::left_join(
-    gf_inside_cluster2 %>% dplyr::select(YEAR, TIME_STEP_KEY, PROCESSING_SECTOR, psc_measure_inside_wk),
-    by = c("YEAR", "TIME_STEP_KEY", "PROCESSING_SECTOR")
+    gf_inside_cluster2 %>% dplyr::select(YEAR, TIME_STEP_KEY, HARVEST_SECTOR, psc_measure_inside_wk),
+    by = c("YEAR", "TIME_STEP_KEY", "HARVEST_SECTOR")
   ) %>%
   dplyr::mutate(
     psc_measure_inside_wk = tidyr::replace_na(psc_measure_inside_wk, 0),
-    displaced_gf_catch_wk = tons_gf_inside_wk * proportion_outside_wk
+    STRATA_KEY = paste0(YEAR, "_", TIME_STEP_KEY, "_", HARVEST_SECTOR) # Include YEAR in strata key!
   )
 
+strata_steps <- unique(df_bs_base$STRATA_KEY)
+
+boot_matrix_m1 <- matrix(NA, nrow = n_iterations, ncol = length(strata_steps))
+boot_matrix_m2 <- matrix(NA, nrow = n_iterations, ncol = length(strata_steps))
+colnames(boot_matrix_m1) <- strata_steps
+colnames(boot_matrix_m2) <- strata_steps
+
 for(i in 1:n_iterations) {
+  new_psc_m1_iteration <- numeric(nrow(df_bs_base))
+  new_psc_m2_iteration <- numeric(nrow(df_bs_base))
   
-  # Vector to temporarily store the randomized PSC calculations for this iteration
-  new_psc_iteration <- numeric(nrow(df_bs_base))
-  
-  for(ts in time_steps) {
-    # Isolate the row indices belonging to this specific week/month step
-    ts_indices <- which(df_bs_base$TIME_STEP_KEY == ts)
+  for(st in strata_steps) {
+    st_indices <- which(df_bs_base$STRATA_KEY == st)
+    n_records  <- length(st_indices)
     
-    # Extract the pool of observed rates for this specific time frame
-    psc_pool <- df_bs_base$mean_psc_rate_wk[ts_indices]
-    
-    # If the pool is valid, randomly shuffle the rates across the active areas
-    if(length(psc_pool) > 0) {
-      sampled_rates <- sample(psc_pool, size = length(ts_indices), replace = TRUE)
-      new_psc_iteration[ts_indices] <- df_bs_base$displaced_gf_catch_wk[ts_indices] * sampled_rates
+    if(n_records > 0) {
+      sampled_rows <- sample(st_indices, size = n_records, replace = TRUE)
+      
+      # Method 1 Bootstrap Evaluation
+      new_psc_m1_iteration[st_indices] <- df_bs_base$gf_catch_new[st_indices] * df_bs_base$mean_psc_rate_wk[sampled_rows]
+      
+      # Method 2 Bootstrap Evaluation
+      gf_shared_tons <- df_bs_base$gf_catch_new[st_indices]
+      cpue_m2        <- df_bs_base$hist_gf_cpue_seasonal[sampled_rows]
+      rates_m2       <- df_bs_base$mean_psc_rate_minutes_wk[sampled_rows]
+      
+      mins_needed <- ifelse(cpue_m2 > 0, gf_shared_tons / cpue_m2, 0)
+      new_psc_m2_iteration[st_indices] <- mins_needed * tidyr::replace_na(rates_m2, 0)
     }
   }
   
-  # Summarize the net impact for this specific shuffle loop
   iter_summary <- df_bs_base %>%
-    dplyr::mutate(new_psc_boot = new_psc_iteration) %>%
-    dplyr::group_by(TIME_STEP_KEY) %>%
+    dplyr::mutate(boot_m1 = new_psc_m1_iteration, boot_m2 = new_psc_m2_iteration) %>%
+    dplyr::group_by(YEAR, TIME_STEP_KEY, HARVEST_SECTOR, STRATA_KEY) %>%
     dplyr::summarise(
-      net_change = sum(new_psc_boot, na.rm = TRUE) - max(psc_measure_inside_wk, na.rm = TRUE),
+      sim_outside_m1 = sum(boot_m1, na.rm = TRUE),
+      sim_outside_m2 = sum(boot_m2, na.rm = TRUE),
       .groups = "drop"
+    ) %>%
+    # INCLUDE YEAR IN THIS JOIN TO AVOID MULTI-YEAR MANY-TO-MANY DUPLICATION
+    dplyr::left_join(
+      gf_inside_cluster2 %>% dplyr::select(YEAR, TIME_STEP_KEY, HARVEST_SECTOR, psc_measure_inside_wk),
+      by = c("YEAR", "TIME_STEP_KEY", "HARVEST_SECTOR")
+    ) %>%
+    dplyr::mutate(
+      psc_measure_inside_wk = tidyr::replace_na(psc_measure_inside_wk, 0),
+      net_change_m1 = sim_outside_m1 - psc_measure_inside_wk,
+      net_change_m2 = sim_outside_m2 - psc_measure_inside_wk
     )
   
-  # Map iteration calculations into our tracking matrix
-  for(j in seq_along(time_steps)) {
-    boot_matrix[i, j] <- iter_summary$net_change[iter_summary$TIME_STEP_KEY == time_steps[j]]
+  for(j in seq_along(strata_steps)) {
+    match_idx <- which(iter_summary$STRATA_KEY == strata_steps[j])
+    if(length(match_idx) == 1) { # Strictly 1 match per unique stratum
+      boot_matrix_m1[i, j] <- iter_summary$net_change_m1[match_idx]
+      boot_matrix_m2[i, j] <- iter_summary$net_change_m2[match_idx]
+    }
   }
 }
 
-# Transform the operational matrix into a long format data frame
-boot_long <- as.data.frame(boot_matrix) %>%
-  dplyr::mutate(iteration = 1:n()) %>%
-  tidyr::pivot_longer(-iteration, names_to = "TIME_STEP_KEY", values_to = "net_change")
+# Long transformations
+boot_long_m1 <- as.data.frame(boot_matrix_m1) %>% dplyr::mutate(iteration = 1:n()) %>%
+  tidyr::pivot_longer(-iteration, names_to = "STRATA_KEY", values_to = "net_change")
 
-# Link calendar YEARS back to our time-step keys for clear annual grouping
-year_mapping <- total.join %>% 
-  dplyr::select(TIME_STEP_KEY, YEAR) %>% 
-  dplyr::distinct()
+boot_long_m2 <- as.data.frame(boot_matrix_m2) %>% dplyr::mutate(iteration = 1:n()) %>%
+  tidyr::pivot_longer(-iteration, names_to = "STRATA_KEY", values_to = "net_change")
 
-boot_annual_dist <- boot_long %>%
-  dplyr::left_join(year_mapping, by = "TIME_STEP_KEY") %>%
-  dplyr::group_by(iteration, YEAR) %>%
-  dplyr::summarise(annual_psc_change = sum(net_change, na.rm = TRUE), .groups = "drop")
+strata_year_map <- df_bs_base %>% dplyr::select(STRATA_KEY, YEAR) %>% dplyr::distinct()
 
-# Calculate the final formal 95% Confidence Bounds (2.5th and 97.5th percentiles)
-boot_annual_ci <- boot_annual_dist %>%
-  dplyr::group_by(YEAR) %>%
-  dplyr::summarise(
-    lower_change = quantile(annual_psc_change, 0.025, na.rm = TRUE),
-    upper_change = quantile(annual_psc_change, 0.975, na.rm = TRUE),
-    .groups = "drop"
-  )
+boot_annual_m1 <- boot_long_m1 %>% dplyr::left_join(strata_year_map, by = "STRATA_KEY") %>%
+  dplyr::group_by(iteration, YEAR) %>% dplyr::summarise(annual_change = sum(net_change, na.rm = TRUE), .groups = "drop")
+
+boot_annual_m2 <- boot_long_m2 %>% dplyr::left_join(strata_year_map, by = "STRATA_KEY") %>%
+  dplyr::group_by(iteration, YEAR) %>% dplyr::summarise(annual_change = sum(net_change, na.rm = TRUE), .groups = "drop")
+
+boot_m1_ci <- boot_annual_m1 %>% dplyr::group_by(YEAR) %>%
+  dplyr::summarise(lower_change_m1 = quantile(annual_change, 0.025, na.rm = TRUE),
+                   upper_change_m1 = quantile(annual_change, 0.975, na.rm = TRUE), .groups = "drop")
+
+boot_m2_ci <- boot_annual_m2 %>% dplyr::group_by(YEAR) %>%
+  dplyr::summarise(lower_change_m2 = quantile(annual_change, 0.025, na.rm = TRUE),
+                   upper_change_m2 = quantile(annual_change, 0.975, na.rm = TRUE), .groups = "drop")
+
+boot_annual_ci <- dplyr::left_join(boot_m1_ci, boot_m2_ci, by = "YEAR")
 
 ```
 
+
 ## 12. Evaluate Impacts
 
-Compares the estimated PSC change to the observed PSC (status quo) each year. For this example, summarized by year.
+Compares the estimated PSC change to the observed PSC (status quo) each year.
 
 ```{r}
 
+# ==============================================================================
+# ## 12. Evaluate Impacts
+# ==============================================================================
 #| label: fig-status-quo
 #| fig-width: 12
-#| fig-height: 5
+#| fig-height: 6
 
-# --- total by year (only estimated change) with status quo numbers --- #
+# 1. Clean parameter labels to avoid any trailing workspace text mismatches
+clean_spp <- trimws(toupper(params$psc_spp))
+spp_title_fixed <- case_when(
+  clean_spp == "OTCR" ~ "Snow Crab",
+  clean_spp == "BTCR" ~ "Tanner Crab",
+  clean_spp == "RKCR" ~ "Red King Crab",
+  clean_spp == "HERR" ~ "Herring",
+  TRUE                ~ "Groundfish Species"
+)
+
+# Parse selected method from params (defaults to "both" if missing)
+selected_method <- if (!is.null(params$method)) trimws(tolower(params$method)) else "both"
+
+# 2. Join estimated changes with status quo numbers using the timeline ledger tracking method
 total.join.plot.annual2 <- dplyr::left_join(all_psc_status_quo_annual, total.join.plot.annual, by = c("YEAR"))
-total.join.plot.annual2$est_change_fleet[is.na(total.join.plot.annual2$est_change_fleet)] <- 0
-total.join.plot.annual2$net_new_PSC <- total.join.plot.annual2$sum_psc_status_quo + total.join.plot.annual2$est_change_fleet
-total.join.plot.annual2$LABEL <- paste0("SPECIES")
-colnames(total.join.plot.annual2) <- c("YEAR", "psc_statusquo", "psc_change", "net_new_PSC", "LABEL")
+total.join.plot.annual2$est_change_method1[is.na(total.join.plot.annual2$est_change_method1)] <- 0
+total.join.plot.annual2$est_change_method2[is.na(total.join.plot.annual2$est_change_method2)] <- 0
 
-# STEP 1: Join and calculate the upper/lower bounds BEFORE pivoting the data
+total.join.plot.annual2$net_new_PSC_m1 <- total.join.plot.annual2$sum_psc_status_quo + total.join.plot.annual2$est_change_method1
+total.join.plot.annual2$net_new_PSC_m2 <- total.join.plot.annual2$sum_psc_status_quo + total.join.plot.annual2$est_change_method2
+total.join.plot.annual2$LABEL          <- paste0("SPECIES")
+
+colnames(total.join.plot.annual2) <- c("YEAR", "psc_statusquo", "psc_change_m1", "psc_change_m2", "net_new_PSC_m1", "net_new_PSC_m2", "LABEL")
+
+# 3. STEP 1: Re-center bootstrap variance directly around the deterministic model means
 total.join.plot.annual2 <- total.join.plot.annual2 %>%
   dplyr::left_join(boot_annual_ci, by = "YEAR") %>%
   dplyr::mutate(
-    boot_ymin = psc_statusquo + lower_change,
-    boot_ymax = psc_statusquo + upper_change
+    # Method 1 Relative Transformation
+    boot_median_m1 = (lower_change_m1 + upper_change_m1) / 2,
+    boot_ymin_m1   = net_new_PSC_m1 + (lower_change_m1 - boot_median_m1),
+    boot_ymax_m1   = net_new_PSC_m1 + (upper_change_m1 - boot_median_m1),
+    
+    # Method 2 Relative Transformation
+    boot_median_m2 = (lower_change_m2 + upper_change_m2) / 2,
+    boot_ymin_m2   = net_new_PSC_m2 + (lower_change_m2 - boot_median_m2),
+    boot_ymax_m2   = net_new_PSC_m2 + (upper_change_m2 - boot_median_m2)
   )
 
-# STEP 2: Pivot into long format (keeping our new boot columns intact)
-total.join.plot.annual3 <- total.join.plot.annual2 %>% pivot_longer(
-  cols = c("net_new_PSC", "psc_statusquo"),
+# 4. STEP 2: Pivot long format for clustered bar chart layout
+total.join.plot.annual3 <- total.join.plot.annual2 %>% tidyr::pivot_longer(
+  cols = c("psc_statusquo", "net_new_PSC_m1", "net_new_PSC_m2"),
   names_to = "psc_type",
-  names_prefix = "psc_",
   values_to = "psc_amount",
   values_drop_na = TRUE
 )
 
-# STEP 3: Assign the error bar values exclusively to the net_new_PSC bar rows
+# 5. STEP 3: Isolate upper/lower boundaries based on row categories
 total.join.plot.annual3 <- total.join.plot.annual3 %>%
   dplyr::mutate(
-    ymin = ifelse(psc_type == "net_new_PSC", boot_ymin, NA_real_),
-    ymax = ifelse(psc_type == "net_new_PSC", boot_ymax, NA_real_)
+    ymin = case_when(
+      psc_type == "net_new_PSC_m1" ~ boot_ymin_m1,
+      psc_type == "net_new_PSC_m2" ~ boot_ymin_m2,
+      TRUE                         ~ NA_real_  # Leaves status quo clean
+    ),
+    ymax = case_when(
+      psc_type == "net_new_PSC_m1" ~ boot_ymax_m1,
+      psc_type == "net_new_PSC_m2" ~ boot_ymax_m2,
+      TRUE                         ~ NA_real_  # Leaves status quo clean
+    )
   )
 
-# #plot (Updated x to factor(YEAR) to align real historical timelines cleanly)
+# 6. DYNAMIC FILTERING & FACTOR MAPPING BASED ON params$method
+if (selected_method == "m1") {
+  total.join.plot.annual3 <- total.join.plot.annual3 %>%
+    dplyr::filter(psc_type %in% c("psc_statusquo", "net_new_PSC_m1"))
+  
+  method_levels <- c("psc_statusquo", "net_new_PSC_m1")
+  fill_values   <- c("psc_statusquo" = "#757575", "net_new_PSC_m1" = "#4daf4a")
+  fill_labels   <- c("Status Quo Observed Baseline", "Method 1: Catch Volume Only (Dynamic Weekly)")
+
+} else if (selected_method == "m2") {
+  total.join.plot.annual3 <- total.join.plot.annual3 %>%
+    dplyr::filter(psc_type %in% c("psc_statusquo", "net_new_PSC_m2"))
+  
+  method_levels <- c("psc_statusquo", "net_new_PSC_m2")
+  fill_values   <- c("psc_statusquo" = "#757575", "net_new_PSC_m2" = "#e41a1c")
+  fill_labels   <- c("Status Quo Observed Baseline", "Method 2: CPUE Effort Constrained (Seasonal Baseline)")
+
+} else { # "both" or default
+  method_levels <- c("psc_statusquo", "net_new_PSC_m1", "net_new_PSC_m2")
+  fill_values   <- c("psc_statusquo" = "#757575", "net_new_PSC_m1" = "#4daf4a", "net_new_PSC_m2" = "#e41a1c")
+  fill_labels   <- c(
+    "Status Quo Observed Baseline", 
+    "Method 1: Catch Volume Only (Dynamic Weekly)", 
+    "Method 2: CPUE Effort Constrained (Seasonal Baseline)"
+  )
+}
+
+# Enforce explicit factorization order
+total.join.plot.annual3$psc_type <- factor(
+  total.join.plot.annual3$psc_type,
+  levels = method_levels
+)
+
+# 7. STEP 4: Render plot using dynamic matching values
 ggplot(total.join.plot.annual3, aes(x = factor(YEAR), y = psc_amount, fill = psc_type)) +
-  ggtitle(paste0(spp_title, ": ", title_name)) +
-  geom_bar(stat = "identity", position = position_dodge(width = 0.7), width = 0.7) +
+  ggtitle(paste0(spp_title_fixed, ": ", title_name)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.75, alpha = 0.9) +
   geom_errorbar(
     aes(ymin = ymin, ymax = ymax, group = psc_type),
-    position = position_dodge(width = 0.7),
-    width = 0.2,
+    position = position_dodge(width = 0.8),
+    width = 0.25,
     color = "black",
     linewidth = 0.7,
     na.rm = TRUE
   ) +
   theme_bw() +
-  labs(x = "Year", y = "Estimated Annual PSC (# Fish / Wt)") +
-  scale_fill_brewer(palette = "Paired", name = "Closure Scenario", labels = c("RKCSSA", "Status Quo")) +
-  theme(plot.title = element_text(hjust = 0.5))
+  labs(x = "Fishery Calendar Year", y = "Estimated Annual PSC (# Fish / Wt)") +
+  scale_fill_manual(
+    values = fill_values,
+    labels = fill_labels,
+    name   = "Closure Scenario"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+    legend.position = "bottom"
+  )
 
 ```
 
-## 13. Summary Statistics
+## Summary Statistics
 
 ```{r}
 
@@ -652,229 +1171,713 @@ ggplot(total.join.plot.annual3, aes(x = factor(YEAR), y = psc_amount, fill = psc
 #| fig-width: 8
 #| fig-height: 5
 
-# Final summary table
-final.summary.table <- total.join.plot.annual2 %>% dplyr::select(YEAR, psc_statusquo, net_new_PSC, psc_change)
-final.summary.table <- as.data.frame(final.summary.table)
-colnames(final.summary.table) <- c("year", "PSC_status_quo", "PSC_closure", "Net_Change")
+suppressPackageStartupMessages({
+  library(dplyr)
+})
 
-# Safe percentage calculation handling potential zero-activity years
-final.summary.table$percent_change <- ifelse(
-  final.summary.table$PSC_status_quo > 0,
-  (final.summary.table$Net_Change / final.summary.table$PSC_status_quo) * 100,
-  0
-)
+# Parse selected method from params (defaults to "both" if missing)
+selected_method <- if (!is.null(params$method)) trimws(tolower(params$method)) else "both"
 
-print(final.summary.table)
-
-```
-
-## 14. Validate Movement - 1-Year Lag
-
-To validate the accuracy of the model's displacement predictions, we use a 1-year time lag to compare the proportion of groundfish catch in the outside stat_areas after a closure to the actual observations the following year under actual closures in 2022 and 2023. For this example, we show a correlation of 0.66 in the first year of the closure, and 0.89 in the second. This supports the use of historical catch proportions as a proxy for predicting where vessels with go when faced with a closure.
-
-```{r}
-
-# ==============================================================================
-# LAGGED PREDICTOR BASELINE (Prior Years: 2021 & 2022)
-# ==============================================================================
-#| label: predictive-baseline-lagged
-
-prop_df_clean <- as.data.frame(propdat)
-
-# Extract the prior years' distributions using your exact structural layout
-annual_spatial_distribution_lagged <- prop_df_clean %>%
-  dplyr::filter(YEAR %in% c(2021, 2022)) %>% 
-  dplyr::group_by(YEAR, STAT_AREA, PROCESSING_SECTOR) %>% 
-  dplyr::summarise(
-    annual_mean_stat_prop_prior = mean(proportion_outside_wk, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  # BRIDGE STEP: Advance the year value by +1 so it aligns with the target validation year
-  dplyr::mutate(
-    VALIDATION_YEAR_MATCH = YEAR + 1
-  )
-
-# ==============================================================================
-# ACTUAL OBSERVED (Validation Years: 2022 & 2023)
-# ==============================================================================
-#| label: validation-footprint
-
-# Isolate your validation years using the exact same structure
-annual_spatial_distribution_validation <- prop_df_clean %>%
-  dplyr::filter(YEAR %in% c(2022, 2023)) %>% 
-  dplyr::group_by(YEAR, STAT_AREA, PROCESSING_SECTOR) %>%  
-  dplyr::summarise(
-    annual_mean_stat_prop_actual = mean(proportion_outside_wk, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-# ==============================================================================
-# DIRECT VALIDATION JOIN & PLOT (Prior-Year Lagged Evaluation)
-# ==============================================================================
-#| label: validation-diagnostics
-
-# Join them by aligning the actual validation year with the lagged predictor's match key
-validation_master_table <- annual_spatial_distribution_validation %>%
-  dplyr::inner_join(
-    annual_spatial_distribution_lagged, 
-    by = c("YEAR" = "VALIDATION_YEAR_MATCH", "STAT_AREA", "PROCESSING_SECTOR")
-  )
-
-# Calculate simple accuracy metrics comparing actual distributions to the prior year's footprint
-validation_metrics <- validation_master_table %>%
-  dplyr::group_by(YEAR, PROCESSING_SECTOR) %>%
-  dplyr::summarise(
-    RMSE = sqrt(mean((annual_mean_stat_prop_actual - annual_mean_stat_prop_prior)^2, na.rm = TRUE)),
-    Correlation = cor(annual_mean_stat_prop_actual, annual_mean_stat_prop_prior, use = "complete.obs"),
-    .groups = "drop"
-  )
-
-print(as.data.frame(validation_metrics))
-
-# Plot the short-term memory model fit
-ggplot(validation_master_table, aes(x = annual_mean_stat_prop_prior, y = annual_mean_stat_prop_actual, color = factor(YEAR))) +
-  geom_point(size = 3.5, alpha = 0.8) +
-  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray40") +
-  theme_bw() +
-  labs(
-    title = paste0("Prior-Year Lagged Validation Fit: ", title_name),
-    x = "Prior Year Expected Proportions (2021 & 2022)",
-    y = "Actual Observed Proportions (2022 & 2023)",
-    color = "Closure Year"
-  ) +
-  theme(plot.title = element_text(face = "bold", hjust = 0.5))
-
-```
-
-## 15. How did our PSC estimates do?
-
-To validate the accuracy of our PSC estimates under the closure, we used a historical baseline (2009-2021) of total annual PSC rates (Z_hist = PSC_hist / GF_hist) to compare to the predicted (Z_pred) and actual (Z_obs) PSC rates under the groundfish catch observed in each closure year (GF_obs). PSC catch = PSC Rate * GF Catch.
-
-```{r}
-
-#| label: global-volume-triple-check
-#| fig-width: 8
-#| fig-height: 5
-
-# 1. Calculate the historical aggregate baseline rate (2009-2021 Outside)
-historical_baseline_rate <- ledger_df_clean %>%
-  dplyr::filter(YEAR %in% c(2009:2021)) %>%
-  dplyr::summarise(
-    total_hist_psc = sum(PSC_VALUE, na.rm = TRUE),
-    total_hist_gf  = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
-    .groups = "drop"
+# 1. Base table construction with all calculated metrics
+final.summary.table_base <- total.join.plot.annual2 %>% 
+  dplyr::select(
+    Year           = YEAR, 
+    PSC_Status_Quo = psc_statusquo, 
+    PSC_M1_Volume  = net_new_PSC_m1, 
+    Net_Change_M1  = psc_change_m1,
+    PSC_M2_Effort  = net_new_PSC_m2, 
+    Net_Change_M2  = psc_change_m2
   ) %>%
   dplyr::mutate(
-    mean_baseline_rate = ifelse(total_hist_gf > 0, total_hist_psc / total_hist_gf, 0)
-  ) %>%
-  dplyr::pull(mean_baseline_rate)
-
-# 2. Calculate the standard deviation of the historical annual rates (2009-2021 Outside)
-annual_rates_hist <- ledger_df_clean %>%
-  dplyr::filter(YEAR %in% c(2009:2021)) %>%
-  dplyr::group_by(YEAR) %>%
-  dplyr::summarise(
-    annual_psc = sum(PSC_VALUE, na.rm = TRUE),
-    annual_gf  = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  dplyr::mutate(
-    annual_rate = ifelse(annual_gf > 0, annual_psc / annual_gf, 0)
+    Pct_Change_M1 = ifelse(PSC_Status_Quo > 0, (Net_Change_M1 / PSC_Status_Quo) * 100, 0),
+    Pct_Change_M2 = ifelse(PSC_Status_Quo > 0, (Net_Change_M2 / PSC_Status_Quo) * 100, 0)
   )
 
-historical_baseline_sd <- sd(annual_rates_hist$annual_rate, na.rm = TRUE)
-if (is.na(historical_baseline_sd)) historical_baseline_sd <- 0
-
-# 3. Model-Implied Post-Closure Rate Baseline (2009-2021 Simulated)
-model_closure_rate <- total.join %>%
-  dplyr::filter(YEAR %in% c(2009:2021)) %>%
-  dplyr::summarise(
-    total_model_psc = sum(new_PSC_wk, na.rm = TRUE),
-    total_model_gf  = sum(tons_gf_annual_stat, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  dplyr::mutate(
-    predicted_closure_rate = ifelse(total_model_gf > 0, total_model_psc / total_model_gf, 0)
-  ) %>%
-  dplyr::pull(predicted_closure_rate)
-
-# 4. Scale tracks against actual 2022/2023 landings
-triple_volume_comparison <- ledger_df_clean %>%
-  dplyr::filter(YEAR %in% c(2022, 2023)) %>%
-  dplyr::group_by(YEAR, PROCESSING_SECTOR) %>%
-  dplyr::summarise(
-    actual_tonnage_landed = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
-    Actual_Observed_PSC_T  = sum(PSC_VALUE, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  dplyr::mutate(
-    Unconstrained_Historical_PSC_Z_hist    = actual_tonnage_landed * historical_baseline_rate,
-    Unconstrained_Historical_PSC_Z_hist_sd = actual_tonnage_landed * historical_baseline_sd,
-    Model_Predicted_PSC_Z_model            = actual_tonnage_landed * model_closure_rate
-  )
-
-# Pivot data into long format for clear multi-bar grouping
-plot_triple_data <- triple_volume_comparison %>%
-  dplyr::select(YEAR, Unconstrained_Historical_PSC_Z_hist, Model_Predicted_PSC_Z_model, Actual_Observed_PSC_T) %>%
-  tidyr::pivot_longer(
-    cols = c("Unconstrained_Historical_PSC_Z_hist", "Model_Predicted_PSC_Z_model", "Actual_Observed_PSC_T"),
-    names_to = "Scenario_Type",
-    values_to = "PSC_Count"
-  )
-
-# Join the error metrics back to the long plotting table
-plot_triple_data <- plot_triple_data %>%
-  dplyr::left_join(triple_volume_comparison %>% dplyr::select(YEAR, Unconstrained_Historical_PSC_Z_hist_sd), by = "YEAR") %>%
-  dplyr::mutate(
-    # Apply variance limits ONLY to the Historical bar, leave others as NA
-    ymin = ifelse(Scenario_Type == "Unconstrained_Historical_PSC_Z_hist", pmax(0, PSC_Count - Unconstrained_Historical_PSC_Z_hist_sd), NA_real_),
-    ymax = ifelse(Scenario_Type == "Unconstrained_Historical_PSC_Z_hist", PSC_Count + Unconstrained_Historical_PSC_Z_hist_sd, NA_real_)
-  )
-
-# Set up clean factor levels to dictate left-to-right bar ordering
-plot_triple_data$Scenario_Type <- factor(
-  plot_triple_data$Scenario_Type,
-  levels = c("Unconstrained_Historical_PSC_Z_hist", "Model_Predicted_PSC_Z_model", "Actual_Observed_PSC_T")
-)
-
-# Generate the Plot
-ggplot(plot_triple_data, aes(x = factor(YEAR), y = PSC_Count, fill = Scenario_Type)) +
-  geom_bar(stat = "identity", position = position_dodge(width = 0.75), alpha = 0.9, width = 0.75) +
-  geom_errorbar(
-    aes(ymin = ymin, ymax = ymax, group = Scenario_Type), 
-    position = position_dodge(width = 0.75),             
-    width = 0.25,
-    color = "black",
-    linewidth = 0.8,
-    na.rm = TRUE
-  ) +
-  scale_fill_manual(
-    values = c(
-      "Unconstrained_Historical_PSC_Z_hist" = "#757575", # Dark Grey
-      "Model_Predicted_PSC_Z_model"         = "#e41a1c", # Red
-      "Actual_Observed_PSC_T"               = "#377eb8"  # Blue
-    ),
-    labels = c(
-      "Historical Baseline (Z_hist) ± SD", 
-      "Model-Predicted Closure (Z_model)", 
-      "Actual Observed Reality (T)"
+# 2. Dynamically select columns based on params$method
+if (selected_method == "m1") {
+  final.summary.table <- final.summary.table_base %>%
+    dplyr::select(
+      Year, 
+      PSC_Status_Quo, 
+      PSC_M1_Volume, 
+      Net_Change_M1, 
+      Pct_Change_M1
     )
-  ) +
+} else if (selected_method == "m2") {
+  final.summary.table <- final.summary.table_base %>%
+    dplyr::select(
+      Year, 
+      PSC_Status_Quo, 
+      PSC_M2_Effort, 
+      Net_Change_M2, 
+      Pct_Change_M2
+    )
+} else { # "both" or default
+  final.summary.table <- final.summary.table_base %>%
+    dplyr::select(
+      Year, 
+      PSC_Status_Quo, 
+      PSC_M1_Volume, 
+      Net_Change_M1, 
+      Pct_Change_M1,
+      PSC_M2_Effort, 
+      Net_Change_M2, 
+      Pct_Change_M2
+    )
+}
+
+final.summary.table <- as.data.frame(final.summary.table)
+
+# Format for clean console printing
+print(dplyr::mutate_if(final.summary.table, is.numeric, round, 1))
+
+```
+
+## 15. Retrospective Analysis Summary
+
+```{r}
+
+#| label: summary-statement
+#| echo: false
+
+fmt_pct <- function(x) sprintf("%+.1f%%", x)
+
+m1_min <- min(final.summary.table$Pct_Change_M1, na.rm = TRUE)
+m1_max <- max(final.summary.table$Pct_Change_M1, na.rm = TRUE)
+
+# Build text dynamically
+if (selected_method == "m1") {
+  text_out <- sprintf(
+    "Under Method 1 (Catch Volume), the estimated percent change in annual PSC ranged from **%s** to **%s** relative to the Status Quo forecast.",
+    fmt_pct(m1_min), fmt_pct(m1_max)
+  )
+} else if (selected_method == "m2") {
+  m2_min <- min(final.summary.table$Pct_Change_M2, na.rm = TRUE)
+  m2_max <- max(final.summary.table$Pct_Change_M2, na.rm = TRUE)
+  
+  text_out <- sprintf(
+    "Under Method 2 (CPUE Effort), the estimated percent change in annual PSC ranged from **%s** to **%s** relative to the Status Quo forecast.",
+    fmt_pct(m2_min), fmt_pct(m2_max)
+  )
+} else {
+  m2_min <- min(final.summary.table$Pct_Change_M2, na.rm = TRUE)
+  m2_max <- max(final.summary.table$Pct_Change_M2, na.rm = TRUE)
+  
+  text_out <- sprintf(
+    "The estimated percent change in annual PSC relative to the Status Quo forecast ranged from **%s** to **%s** for Method 1 (Catch Volume) and from **%s** to **%s** for Method 2 (CPUE Effort).",
+    fmt_pct(m1_min), fmt_pct(m1_max), fmt_pct(m2_min), fmt_pct(m2_max)
+  )
+}
+
+# Construct Quarto Native Callout Block
+callout_block <- sprintf(
+  "\n\n::: {.callout-note appearance=\"simple\" icon=false}\n%s\n:::\n\n",
+  text_out
+)
+
+# Force knitr to output as direct Markdown (prevents code block wrapping)
+knitr::asis_output(callout_block)
+
+```
+
+
+
+# AR(1) PROJECTIONS
+This step runs an AR(1) projection for each year using the data available to it at time, t. This produces a blind projection for each year using only data up to the previous year. In this example, the AR(1) projection of no closure (blue line) is able to stay within the ballpark of the actual observed PSC that occurred each year (black line). The AR(1) projection under a closure scenario (green line) shows only minor differences from the non-closure (blue). 
+
+## 1. Use AR(1) to forward-project PSC catch and reductions given a closure
+
+```{r}
+
+# ==============================================================================
+# STEP 1: DIFFERENCED ARIMA(1,1,0) WITH 5-YEAR ROLLING MEMORY & t-1 FOOTPRINT
+# ==============================================================================
+#| label: step1-ar1-differenced-5yr
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+})
+
+# 1. DIFFERENCED / RANDOM WALK ARIMA(1, 1, 0) FORECASTING FUNCTION
+forecast_ar1_differenced <- function(series_vec) {
+  series_vec <- series_vec[!is.na(series_vec)]
+  n <- length(series_vec)
+  
+  if (n == 0) return(c(pred = 0, se = 0))
+  if (n == 1) return(c(pred = series_vec[1], se = 0))
+  if (var(series_vec) == 0) return(c(pred = series_vec[n], se = 0))
+  
+  # If n <= 3 within the 5-year window, fallback to Last-Observation-Carried-Forward
+  if (n <= 3) {
+    return(c(pred = series_vec[n], se = sd(series_vec) / sqrt(pmax(1, n))))
+  }
+  
+  fit <- tryCatch({
+    suppressWarnings(
+      arima(series_vec, order = c(1, 1, 0), method = "CSS-ML")
+    )
+  }, error = function(e) { NULL })
+  
+  if (!is.null(fit)) {
+    p <- predict(fit, n.ahead = 1)
+    return(c(pred = pmax(0, as.numeric(p$pred[1])), se = as.numeric(p$se[1])))
+  } else {
+    # Fallback to Last-Observation-Carried-Forward (LOCF)
+    return(c(pred = series_vec[n], se = sd(series_vec, na.rm = TRUE)))
+  }
+}
+
+# 2. ROLLING FORECAST LOOP WITH 5-YEAR HISTORICAL MEMORY [t-5, t-1] & t-1 FOOTPRINT
+all_years  <- sort(unique(catch_data_binned$YEAR))
+eval_years <- all_years[all_years >= (min(all_years) + 3)] # Evaluates 2012+
+
+predicted_primitives_list <- list()
+
+for (target_yr in eval_years) {
+  
+  prior_yr  <- target_yr - 1
+  mem_start <- target_yr - 5  # STRICT 5-YEAR ROLLING MEMORY FLOOR [t-5, t-1]
+  
+  # A. Historical memory: strictly restricted to 5-year trailing window
+  hist_memory <- catch_data_binned %>%
+    dplyr::filter(
+      YEAR >= mem_start & YEAR < target_yr,
+      STAT_AREA %in% local_stat_areas
+    ) %>%
+    dplyr::mutate(
+      cell_rate_mt = ifelse(GF_TOTAL_CATCH_MT >= 1.0, PSC_VALUE / GF_TOTAL_CATCH_MT, 0)
+    )
+  
+  # B. ACTIVE SPATIAL DOMAIN: Cells active in Year t-1 ONLY
+  active_cells_t1 <- catch_data_binned %>%
+    dplyr::filter(YEAR == prior_yr, GF_TOTAL_CATCH_MT > 0) %>%
+    dplyr::select(TIME_STEP_KEY, STAT_AREA, HARVEST_SECTOR, SPECIES_GROUP_CODE) %>%
+    dplyr::distinct()
+  
+  # C. Fit Differenced AR(1,1,0) models & mask by t-1 footprint
+  grid_forecast <- hist_memory %>%
+    dplyr::group_by(TIME_STEP_KEY, STAT_AREA, HARVEST_SECTOR, SPECIES_GROUP_CODE) %>%
+    dplyr::summarise(
+      fc_gf   = list(forecast_ar1_differenced(GF_TOTAL_CATCH_MT)),
+      fc_rate = list(forecast_ar1_differenced(cell_rate_mt)),
+      fc_eff  = list(forecast_ar1_differenced(EFFORT_MINUTES)),
+      .groups = "drop"
+    ) %>%
+    dplyr::inner_join(
+      active_cells_t1,
+      by = c("TIME_STEP_KEY", "STAT_AREA", "HARVEST_SECTOR", "SPECIES_GROUP_CODE")
+    ) %>%
+    dplyr::mutate(
+      YEAR               = as.integer(target_yr),
+      
+      GF_TOTAL_CATCH_MT  = pmax(0, sapply(fc_gf, function(x) x["pred"])),
+      se_gf_mt           = sapply(fc_gf, function(x) x["se"]),
+      
+      pred_rate_mt       = pmax(0, sapply(fc_rate, function(x) x["pred"])),
+      
+      # Derived PSC Value: GF * Rate
+      PSC_VALUE          = GF_TOTAL_CATCH_MT * pred_rate_mt,
+      se_psc             = sapply(fc_rate, function(x) x["se"]) * GF_TOTAL_CATCH_MT,
+      
+      EFFORT_MINUTES     = as.integer(round(pmax(1, sapply(fc_eff, function(x) x["pred"])))),
+      se_eff_mins        = sapply(fc_eff, function(x) x["se"])
+    ) %>%
+    dplyr::select(
+      YEAR, TIME_STEP_KEY, STAT_AREA, HARVEST_SECTOR, SPECIES_GROUP_CODE,
+      GF_TOTAL_CATCH_MT, PSC_VALUE, EFFORT_MINUTES,
+      se_gf_mt, se_psc, se_eff_mins
+    )
+  
+  predicted_primitives_list[[as.character(target_yr)]] <- grid_forecast
+}
+
+predicted_primitives_df <- do.call(rbind, predicted_primitives_list)
+
+```
+
+
+## 2. Run each estimation method
+
+```{r}
+# ==============================================================================
+# STEP 2: RUN METHOD 1 (PSC/GF RATES) & METHOD 2 (CPUE EFFORT)
+# ==============================================================================
+#| label: step2-pipeline-both-scenarios
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+})
+
+# 1. CALCULATE EMPIRICAL RATE CV DIRECTLY FROM OBSERVED DATASET
+empirical_rate_cv <- catch_data_binned %>%
+  dplyr::filter(!(STAT_AREA %in% closure.stat.areas)) %>%
+  dplyr::group_by(YEAR, HARVEST_SECTOR) %>%
+  dplyr::summarise(
+    annual_gf_mt  = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
+    annual_psc    = sum(PSC_VALUE, na.rm = TRUE),
+    annual_rate   = ifelse(annual_gf_mt > 0, annual_psc / annual_gf_mt, 0),
+    .groups = "drop"
+  ) %>%
+  dplyr::group_by(HARVEST_SECTOR) %>%
+  dplyr::summarise(
+    cv_data = ifelse(mean(annual_rate, na.rm = TRUE) > 0, 
+                     sd(annual_rate, na.rm = TRUE) / mean(annual_rate, na.rm = TRUE), 
+                     0.05),
+    .groups = "drop"
+  )
+
+cv_data_factor <- mean(empirical_rate_cv$cv_data, na.rm = TRUE)
+
+# 2. CORE REDISTRIBUTION PIPELINE
+run_redistribution_pipeline <- function(pred_df, is_closure_active) {
+  stat_areas_closed <- as.character(closure.stat.areas)
+  
+  pred_impacted_cluster <- pred_df %>%
+    dplyr::mutate(
+      STAT_AREA = stringr::str_pad(trimws(as.character(STAT_AREA)), width = 6, side = "left", pad = "0"),
+      inside    = ifelse(STAT_AREA %in% stat_areas_closed, "yes", "no"),
+      impacted  = ifelse(is_closure_active, "yes", "no")
+    )
+  
+  # --- STEP A: INSIDE CATCH SUMMARY ---
+  gf_inside_cluster_pred <- pred_impacted_cluster %>%
+    dplyr::filter(inside == "yes") %>%
+    dplyr::group_by(YEAR, TIME_STEP_KEY, HARVEST_SECTOR) %>%
+    dplyr::summarise(
+      tons_gf_inside_wk     = sum(GF_TOTAL_CATCH_MT * (impacted == "yes"), na.rm = TRUE),
+      psc_measure_inside_wk = sum(PSC_VALUE * (impacted == "no"), na.rm = TRUE),
+      # Safely handle NA effort for unobserved landings
+      effort_inside_wk      = ifelse(all(is.na(EFFORT_MINUTES)), NA_real_, sum(EFFORT_MINUTES, na.rm = TRUE)),
+      .groups = "drop"
+    )
+  
+  # --- STEP B: OUTSIDE PERFORMANCE MATRIX ---
+  gf_outside_cluster_pred <- pred_impacted_cluster %>%
+    dplyr::filter(inside == "no") %>%
+    dplyr::mutate(DYNAMIC_SEASONAL_KEY = TIME_STEP_KEY)
+  
+  # 3-Year Rolling Historical Baseline Profile (t-3 to t-1 relative to target_yr)
+  rolling_cpue_list_pred <- list()
+  all_pred_years <- sort(unique(gf_outside_cluster_pred$YEAR))
+  min_pred_yr    <- min(all_pred_years)
+  
+  for (target_yr in all_pred_years) {
+    w_start <- max(min_pred_yr, target_yr - 3)
+    w_end   <- max(min_pred_yr, target_yr - 1)
+    
+    if(target_yr == min_pred_yr) { w_start <- target_yr; w_end <- target_yr }
+    
+    hist_window <- catch_data_binned %>%
+      dplyr::filter(
+        !(STAT_AREA %in% stat_areas_closed),
+        YEAR >= w_start & YEAR <= w_end
+      ) %>%
+      dplyr::group_by(TIME_STEP_KEY, STAT_AREA, HARVEST_SECTOR) %>%
+      dplyr::summarise(
+        sum_tons_3yr   = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
+        sum_effort_3yr = ifelse(all(is.na(EFFORT_MINUTES)), NA_real_, sum(EFFORT_MINUTES, na.rm = TRUE)),
+        sum_psc_3yr    = sum(PSC_VALUE, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(
+        hist_gf_cpue_seasonal  = ifelse(target_yr > min_pred_yr & !is.na(sum_effort_3yr) & sum_effort_3yr > 0, 
+                                        sum_tons_3yr / sum_effort_3yr, NA_real_),
+        hist_psc_rate_mins_3yr = ifelse(target_yr > min_pred_yr & !is.na(sum_effort_3yr) & sum_effort_3yr > 0, 
+                                        sum_psc_3yr / sum_effort_3yr, NA_real_),
+        YEAR = target_yr,
+        DYNAMIC_SEASONAL_KEY = TIME_STEP_KEY
+      ) %>%
+      dplyr::select(YEAR, DYNAMIC_SEASONAL_KEY, STAT_AREA, HARVEST_SECTOR, hist_gf_cpue_seasonal, hist_psc_rate_mins_3yr)
+    
+    rolling_cpue_list_pred[[as.character(target_yr)]] <- hist_window
+  }
+  
+  historical_cpue_profile_pred <- do.call(rbind, rolling_cpue_list_pred)
+  
+  # Regional Sector Fallback Grid (Separated cleanly by HARVEST_SECTOR)
+  reg_fallbacks_pred <- catch_data_binned %>%
+    dplyr::filter(!(STAT_AREA %in% closure.stat.areas)) %>%
+    dplyr::group_by(TIME_STEP_KEY, HARVEST_SECTOR) %>%
+    dplyr::summarise(
+      reg_cpue_fallback     = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE) / sum(EFFORT_MINUTES, na.rm = TRUE),
+      reg_psc_mins_fallback = sum(PSC_VALUE, na.rm = TRUE) / sum(EFFORT_MINUTES, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::rename(DYNAMIC_SEASONAL_KEY = TIME_STEP_KEY)
+  
+  weekly_base_metrics_pred <- gf_outside_cluster_pred %>%
+    dplyr::group_by(YEAR, TIME_STEP_KEY, DYNAMIC_SEASONAL_KEY, STAT_AREA, HARVEST_SECTOR) %>%
+    dplyr::summarise(
+      tons_gf_wk           = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE),
+      total_effort_minutes = ifelse(all(is.na(EFFORT_MINUTES)), NA_real_, sum(EFFORT_MINUTES, na.rm = TRUE)),
+      total_psc_count      = sum(PSC_VALUE, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      mean_psc_rate_wk = ifelse(tons_gf_wk > 0, total_psc_count / tons_gf_wk, 0)
+    ) %>%
+    dplyr::left_join(
+      gf_outside_cluster_pred %>%
+        dplyr::group_by(YEAR, TIME_STEP_KEY, HARVEST_SECTOR) %>%
+        dplyr::summarise(tons_gf_annual = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE), .groups = "drop"),
+      by = c("YEAR", "TIME_STEP_KEY", "HARVEST_SECTOR")
+    ) %>%
+    dplyr::left_join(
+      gf_outside_cluster_pred %>%
+        dplyr::group_by(YEAR, TIME_STEP_KEY, STAT_AREA, HARVEST_SECTOR) %>%
+        dplyr::summarise(tons_gf_annual_stat = sum(GF_TOTAL_CATCH_MT, na.rm = TRUE), .groups = "drop"),
+      by = c("YEAR", "TIME_STEP_KEY", "STAT_AREA", "HARVEST_SECTOR")
+    ) %>%
+    dplyr::mutate(
+      proportion_outside_wk = ifelse(tons_gf_annual > 0, tons_gf_annual_stat / tons_gf_annual, 0)
+    )
+  
+  sum.stat.timeseries.gf_pred <- weekly_base_metrics_pred %>%
+    dplyr::left_join(
+      historical_cpue_profile_pred,
+      by = c("YEAR", "DYNAMIC_SEASONAL_KEY", "STAT_AREA", "HARVEST_SECTOR")
+    ) %>%
+    dplyr::left_join(
+      reg_fallbacks_pred,
+      by = c("DYNAMIC_SEASONAL_KEY", "HARVEST_SECTOR")
+    ) %>%
+    dplyr::mutate(
+      # Coalesce to regional fallback whenever local stat cell CPUE is NA
+      hist_gf_cpue_seasonal  = dplyr::coalesce(hist_gf_cpue_seasonal, reg_cpue_fallback),
+      hist_psc_rate_mins_3yr = dplyr::coalesce(hist_psc_rate_mins_3yr, reg_psc_mins_fallback, 0)
+    ) %>%
+    as.data.frame()
+  
+  # --- STEP C: EXECUTE DISPLACEMENT MATRIX ---
+  total.join.master.pred <- sum.stat.timeseries.gf_pred %>%
+    dplyr::left_join(
+      gf_inside_cluster_pred %>% dplyr::select(YEAR, TIME_STEP_KEY, HARVEST_SECTOR, tons_gf_inside_wk),
+      by = c("YEAR", "TIME_STEP_KEY", "HARVEST_SECTOR")
+    ) %>%
+    dplyr::mutate(
+      tons_gf_inside_wk = tidyr::replace_na(tons_gf_inside_wk, 0),
+      gf_catch_new      = tons_gf_inside_wk * proportion_outside_wk,
+      
+      # Method 1
+      new_PSC_method1   = gf_catch_new * mean_psc_rate_wk,
+      
+      # Method 2
+      effort_minutes_needed = ifelse(!is.na(hist_gf_cpue_seasonal) & hist_gf_cpue_seasonal > 0, 
+                                     gf_catch_new / hist_gf_cpue_seasonal, 0),
+      new_PSC_method2       = effort_minutes_needed * tidyr::replace_na(hist_psc_rate_mins_3yr, 0)
+    )
+  
+  ledger_weekly_pred <- total.join.master.pred %>%
+    dplyr::group_by(YEAR, TIME_STEP_KEY, HARVEST_SECTOR) %>%
+    dplyr::summarise(
+      wk_out_base_psc = sum(total_psc_count, na.rm = TRUE),
+      new_PSC_m1_wk   = sum(new_PSC_method1, na.rm = TRUE),
+      new_PSC_m2_wk   = sum(new_PSC_method2, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::left_join(
+      gf_inside_cluster_pred %>% dplyr::select(YEAR, TIME_STEP_KEY, HARVEST_SECTOR, psc_measure_inside_wk),
+      by = c("YEAR", "TIME_STEP_KEY", "HARVEST_SECTOR")
+    ) %>%
+    dplyr::mutate(
+      psc_measure_inside_wk = tidyr::replace_na(psc_measure_inside_wk, 0),
+      net_total_m1_wk       = wk_out_base_psc + psc_measure_inside_wk + new_PSC_m1_wk,
+      net_total_m2_wk       = wk_out_base_psc + psc_measure_inside_wk + new_PSC_m2_wk
+    )
+  
+  total.join.plot.annual.pred <- ledger_weekly_pred %>%
+    dplyr::group_by(YEAR) %>%
+    dplyr::summarise(
+      proj_m1_mean = sum(net_total_m1_wk, na.rm = TRUE),
+      proj_m2_mean = sum(net_total_m2_wk, na.rm = TRUE),
+      
+      proj_m1_se   = sqrt(sum((net_total_m1_wk * cv_data_factor)^2, na.rm = TRUE)),
+      proj_m2_se   = sqrt(sum((net_total_m2_wk * cv_data_factor)^2, na.rm = TRUE)),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      m1_lower = pmax(0, proj_m1_mean - 1.96 * proj_m1_se),
+      m1_upper = proj_m1_mean + 1.96 * proj_m1_se,
+      m2_lower = pmax(0, proj_m2_mean - 1.96 * proj_m2_se),
+      m2_upper = proj_m2_mean + 1.96 * proj_m2_se
+    )
+  
+  return(total.join.plot.annual.pred)
+}
+
+# Run both scenario passes
+pred_sq_df      <- run_redistribution_pipeline(predicted_primitives_df, is_closure_active = FALSE)
+pred_closure_df <- run_redistribution_pipeline(predicted_primitives_df, is_closure_active = TRUE)
+
+```
+
+
+
+## 3. Plot against observations
+
+```{r}
+
+#| label: step3-validation-plot-all5
+#| fig-width: 11
+#| fig-height: 7
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(scales)
+})
+
+# Parse selected method from params (defaults to "both" if missing)
+selected_method <- if (!is.null(params$method)) trimws(tolower(params$method)) else "both"
+
+# ==============================================================================
+# 1. JOIN OBSERVED REALITY + STATUS QUO FORECAST + CLOSURE FORECASTS
+# ==============================================================================
+val_all5_df <- total.join.plot.annual2 %>%
+  dplyr::select(YEAR, psc_statusquo) %>%
+  dplyr::inner_join(
+    pred_sq_df %>% dplyr::select(YEAR, sq_ar1_mean = proj_m1_mean, sq_ar1_lower = m1_lower, sq_ar1_upper = m1_upper),
+    by = "YEAR"
+  ) %>%
+  dplyr::inner_join(
+    pred_closure_df %>% dplyr::select(YEAR, proj_m1_mean, m1_lower, m1_upper, proj_m2_mean, m2_lower, m2_upper),
+    by = "YEAR"
+  )
+
+# Base Line Series
+plot_lines_base <- val_all5_df %>%
+  dplyr::select(YEAR, psc_statusquo, sq_ar1_mean, proj_m1_mean, proj_m2_mean)
+
+# Base Ribbon Series
+plot_ribbons_sq <- val_all5_df %>%
+  dplyr::select(YEAR, sq_ar1_lower, sq_ar1_upper) %>%
+  dplyr::mutate(Metric = "sq_ar1_mean", ymin = sq_ar1_lower, ymax = sq_ar1_upper) %>%
+  dplyr::select(YEAR, Metric, ymin, ymax)
+
+plot_ribbons_m1 <- val_all5_df %>%
+  dplyr::select(YEAR, m1_lower, m1_upper) %>%
+  dplyr::mutate(Metric = "proj_m1_mean", ymin = m1_lower, ymax = m1_upper) %>%
+  dplyr::select(YEAR, Metric, ymin, ymax)
+
+plot_ribbons_m2 <- val_all5_df %>%
+  dplyr::select(YEAR, m2_lower, m2_upper) %>%
+  dplyr::mutate(Metric = "proj_m2_mean", ymin = m2_lower, ymax = m2_upper) %>%
+  dplyr::select(YEAR, Metric, ymin, ymax)
+
+# Filter columns, ribbons, and scales based on selected_method
+if (selected_method == "m1") {
+  plot_lines <- plot_lines_base %>% dplyr::select(-proj_m2_mean)
+  plot_ribbons <- dplyr::bind_rows(plot_ribbons_sq, plot_ribbons_m1)
+  
+  metric_levels <- c("psc_statusquo", "sq_ar1_mean", "proj_m1_mean")
+  metric_labels <- c(
+    "Observed Status Quo (Baseline Reality)",
+    "AR(1) Unconditional Forecast (Status Quo Validation)",
+    "Method 1: Projected Catch Volume Model (Closure Active)"
+  )
+  
+  color_vals    <- c("#111111", "#377eb8", "#4daf4a")
+  fill_vals     <- c("transparent", "#377eb8", "#4daf4a")
+  linetype_vals <- c("solid", "dashed", "dashed")
+  shape_vals    <- c(16, 17, 15)
+  subtitle_text <- "AR(1) Status Quo Validation and Catch Volume Model (Method 1) vs Observed Reality"
+
+} else if (selected_method == "m2") {
+  plot_lines <- plot_lines_base %>% dplyr::select(-proj_m1_mean)
+  plot_ribbons <- dplyr::bind_rows(plot_ribbons_sq, plot_ribbons_m2)
+  
+  metric_levels <- c("psc_statusquo", "sq_ar1_mean", "proj_m2_mean")
+  metric_labels <- c(
+    "Observed Status Quo (Baseline Reality)",
+    "AR(1) Unconditional Forecast (Status Quo Validation)",
+    "Method 2: Projected CPUE Effort Model (Closure Active)"
+  )
+  
+  color_vals    <- c("#111111", "#377eb8", "#e41a1c")
+  fill_vals     <- c("transparent", "#377eb8", "#e41a1c")
+  linetype_vals <- c("solid", "dashed", "dotdash")
+  shape_vals    <- c(16, 17, 18)
+  subtitle_text <- "AR(1) Status Quo Validation and CPUE Effort Model (Method 2) vs Observed Reality"
+
+} else { # "both" or default fallback
+  plot_lines <- plot_lines_base
+  plot_ribbons <- dplyr::bind_rows(plot_ribbons_sq, plot_ribbons_m1, plot_ribbons_m2)
+  
+  metric_levels <- c("psc_statusquo", "sq_ar1_mean", "proj_m1_mean", "proj_m2_mean")
+  metric_labels <- c(
+    "Observed Status Quo (Baseline Reality)",
+    "AR(1) Unconditional Forecast (Status Quo Validation)",
+    "Method 1: Projected Catch Volume Model (Closure Active)",
+    "Method 2: Projected CPUE Effort Model (Closure Active)"
+  )
+  
+  color_vals    <- c("#111111", "#377eb8", "#4daf4a", "#e41a1c")
+  fill_vals     <- c("transparent", "#377eb8", "#4daf4a", "#e41a1c")
+  linetype_vals <- c("solid", "dashed", "dashed", "dotdash")
+  shape_vals    <- c(16, 17, 15, 18)
+  subtitle_text <- "AR(1) Status Quo Validation and Closure Redistribution Models (Methods 1 & 2) vs Observed Reality"
+}
+
+# Pivot active lines to long format
+plot_lines_long <- plot_lines %>%
+  tidyr::pivot_longer(-YEAR, names_to = "Metric", values_to = "Mean_Value")
+
+# Assign names to scale vectors for exact manual legend matching
+names(color_vals)    <- metric_labels
+names(fill_vals)     <- metric_labels
+names(linetype_vals) <- metric_labels
+names(shape_vals)    <- metric_labels
+
+# Combine lines and ribbons with strict factor ordering
+plot_unified_data <- dplyr::left_join(plot_lines_long, plot_ribbons, by = c("YEAR", "Metric")) %>%
+  dplyr::mutate(
+    Metric = factor(Metric, levels = metric_levels, labels = metric_labels)
+  )
+
+# ==============================================================================
+# 2. RENDER THE COMPLETE MASTER CHART
+# ==============================================================================
+ggplot(plot_unified_data, aes(x = YEAR, y = Mean_Value, color = Metric, fill = Metric, linetype = Metric, shape = Metric)) +
+  geom_ribbon(aes(ymin = ymin, ymax = ymax), alpha = 0.12, color = NA) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 3) +
+  scale_x_continuous(breaks = sort(unique(plot_unified_data$YEAR))) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_color_manual(values = color_vals, name = "Scenario Model") +
+  scale_fill_manual(values = fill_vals, name = "Scenario Model") +
+  scale_linetype_manual(values = linetype_vals, name = "Scenario Model") +
+  scale_shape_manual(values = shape_vals, name = "Scenario Model") +
   theme_bw() +
   labs(
-    title = paste0("Closure Validation: ", title_name),
-    x = "Emergency Closure Year",
-    y = paste0("Total PSC (", params$psc_spp, " Count)"),
-    fill = "Scenario Track"
+    title = paste0("Unified AR(1) Forward Projection & Scenario Validation: ", title_name),
+    subtitle = subtitle_text,
+    x = "Fishery Calendar Year",
+    y = "Total Regional PSC (# / MT)"
   ) +
   theme(
     plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
-    plot.subtitle = element_text(face = "italic", size = 9, hjust = 0.5),
+    plot.subtitle = element_text(face = "italic", size = 10, hjust = 0.5),
     legend.position = "bottom",
     legend.direction = "vertical",
-    legend.box = "horizontal"
+    axis.text.x = element_text(face = "bold", size = 10),
+    panel.grid.minor = element_blank()
   )
+```
+
+## 4. Summarize PSC Change
+
+```{r}
+
+#| label: final-table2
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(knitr)
+})
+
+# Parse selected method from params (defaults to "both" if missing)
+selected_method <- if (!is.null(params$method)) trimws(tolower(params$method)) else "both"
+
+# ==============================================================================
+# SUMMARY TABLE: PSC PROJECTED TOTALS & PERCENT CHANGES
+# ==============================================================================
+
+# 1. Compute full metrics table
+final.summary.table_base <- val_all5_df %>% 
+  dplyr::mutate(
+    Net_Change_M1 = proj_m1_mean - sq_ar1_mean,
+    Net_Change_M2 = proj_m2_mean - sq_ar1_mean,
+    Pct_Change_M1 = ifelse(sq_ar1_mean > 0, (Net_Change_M1 / sq_ar1_mean) * 100, 0),
+    Pct_Change_M2 = ifelse(sq_ar1_mean > 0, (Net_Change_M2 / sq_ar1_mean) * 100, 0)
+  )
+
+# 2. Dynamically filter columns based on params$method
+if (selected_method == "m1") {
+  final.summary.table2 <- final.summary.table_base %>%
+    dplyr::select(
+      Year           = YEAR, 
+      PSC_Status_Quo = sq_ar1_mean, 
+      PSC_M1_Volume  = proj_m1_mean, 
+      Net_Change_M1, 
+      Pct_Change_M1
+    )
+} else if (selected_method == "m2") {
+  final.summary.table2 <- final.summary.table_base %>%
+    dplyr::select(
+      Year           = YEAR, 
+      PSC_Status_Quo = sq_ar1_mean, 
+      PSC_M2_Effort  = proj_m2_mean, 
+      Net_Change_M2, 
+      Pct_Change_M2
+    )
+} else { # "both" or default
+  final.summary.table2 <- final.summary.table_base %>%
+    dplyr::select(
+      Year           = YEAR, 
+      PSC_Status_Quo = sq_ar1_mean, 
+      PSC_M1_Volume  = proj_m1_mean, 
+      Net_Change_M1, 
+      Pct_Change_M1,
+      PSC_M2_Effort  = proj_m2_mean, 
+      Net_Change_M2, 
+      Pct_Change_M2
+    )
+}
+
+final.summary.table2 <- as.data.frame(final.summary.table2)
+
+# Console Print (Clean rounded numbers)
+print(dplyr::mutate_if(final.summary.table2, is.numeric, round, 1))
 
 ```
 
+## 5. AR(1) Summary
+
+```{r}
+
+#| label: summary-statement
+#| echo: false
+
+fmt_pct <- function(x) sprintf("%+.1f%%", x)
+
+m1_min <- min(final.summary.table2$Pct_Change_M1, na.rm = TRUE)
+m1_max <- max(final.summary.table2$Pct_Change_M1, na.rm = TRUE)
+
+# Build text dynamically
+if (selected_method == "m1") {
+  text_out <- sprintf(
+    "Under Method 1 (Catch Volume), the estimated percent change in annual PSC ranged from **%s** to **%s** relative to the Status Quo forecast.",
+    fmt_pct(m1_min), fmt_pct(m1_max)
+  )
+} else if (selected_method == "m2") {
+  m2_min <- min(final.summary.table2$Pct_Change_M2, na.rm = TRUE)
+  m2_max <- max(final.summary.table2$Pct_Change_M2, na.rm = TRUE)
+  
+  text_out <- sprintf(
+    "Under Method 2 (CPUE Effort), the estimated percent change in annual PSC ranged from **%s** to **%s** relative to the Status Quo forecast.",
+    fmt_pct(m2_min), fmt_pct(m2_max)
+  )
+} else {
+  m2_min <- min(final.summary.table2$Pct_Change_M2, na.rm = TRUE)
+  m2_max <- max(final.summary.table2$Pct_Change_M2, na.rm = TRUE)
+  
+  text_out <- sprintf(
+    "The estimated percent change in annual PSC relative to the Status Quo forecast ranged from **%s** to **%s** for Method 1 (Catch Volume) and from **%s** to **%s** for Method 2 (CPUE Effort).",
+    fmt_pct(m1_min), fmt_pct(m1_max), fmt_pct(m2_min), fmt_pct(m2_max)
+  )
+}
+
+# Construct Quarto Native Callout Block
+callout_block <- sprintf(
+  "\n\n::: {.callout-note appearance=\"simple\" icon=false}\n%s\n:::\n\n",
+  text_out
+)
+
+# Force knitr to output as direct Markdown (prevents code block wrapping)
+knitr::asis_output(callout_block)
+
+```
 
