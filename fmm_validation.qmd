@@ -8,11 +8,11 @@ format:
     code-fold: true
     self-contained: true
 params:
-  time_step: "monthly" # Options: "weekly", "monthly", "annual"
+  time_step: "weekly" # Options: "weekly", "monthly", "annual"
   timeframe: [2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
   psc_spp: RKCR
   closure: rkcssa
-  buffer: 200000
+  buffer: 100000
   gear: NPT
   sector: CP
   management_code: 
@@ -241,7 +241,7 @@ ggplot() +
 
 ## 5. Catch Data
 
-Load catch data from the catch accounting system (CAS) and assign to stat_areas. Here we are defining groundfish as shallow flatfish (rock sole, yellowfin sole, butter sole, english sole, starry flounder, Alaska Plaice, sand sole) in the NPT Open Access fishery.
+Load catch data from the catch accounting system (CAS) and assign to stat_areas.
 
 ```{r}
 # ==============================================================================
@@ -324,7 +324,7 @@ catch_data2     <- subset(catch_data_full, catch_data_full$STAT_AREA %in% local_
 
 ## 6. Inspect effort and catch
 
-Groundfish catch (shallow flatfish) across months have plenty of activity inside and outside of the proposed area. You can also already see a high degree of temporal autocorrelation from one month-year to the next.
+Groundfish catch.
 ```{r}
 
 #| label: fig-gf-catch
@@ -352,7 +352,7 @@ ggplot() +
 
 ```
 
-PSC across months have plenty of activity inside and outside of the proposed area.
+PSC catch.
 ```{r}
 
 #| label: fig-psc-catch
@@ -379,7 +379,7 @@ ggplot() +
   )
 
 ```
-The effort data is limited due to the partial observer coverage of these CVs, so we're going to just run method 1.
+Effort.
 ```{r}
 
 #| label: fig-gf-effort
@@ -408,7 +408,7 @@ ggplot() +
 ```
 ## 7. Inspect the temporal autocorrelation assumption
 
-As a whole, the monthly NPT OA shallow flatfish fishery has a high temporal autocorrelation from one year to the next. You can also see this pretty clearly in the groundfish catch distributions above. 
+Sufficient temporal autocorrelation from one year to the next. 
 ```{r}
 
 #| label: fig-global-ar1
@@ -547,7 +547,7 @@ print(combined_rates_panel)
 
 ```
 
-By year, the monthly NPT OA shallow flatfish fishery has a very high temporal autocorrelation from one year to the next.
+By year, sufficient high temporal autocorrelation.
 ```{r}
 
 #| label: fig-global-ar1
@@ -724,7 +724,7 @@ total.join.plot.annual2 <- all_psc_status_quo_annual %>%
 ```
 
 # RETROSPECTIVE "WHAT-IF" SCENARIO
-This scenario runs the condition of "what if a closure had occurred" at the given year and time step given. In this example, minor differences in Tanner crab PSC were estimated under a closure, ranging from a 5.7% increase to a 43.2% decrease, but with high uncertainty around those estimates. 
+This scenario runs the condition of "what if a closure had occurred" at the given year and time step given. 
 
 ## 9. Calculate Catch and Proportions Inside/Outside Closure
 
