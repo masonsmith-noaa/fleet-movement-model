@@ -343,7 +343,7 @@ facet_wrap(
     vars(TIME_STEP_KEY), 
     nrow = 5,
     ncol=10
-  )
+  ) +
   theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank()) +
   theme(
     axis.title = element_blank(),
@@ -372,7 +372,7 @@ facet_wrap(
     vars(TIME_STEP_KEY), 
     nrow = 5,
     ncol=10
-  )
+  ) +
   theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank()) +
   theme(
     axis.title = element_blank(),
@@ -400,7 +400,7 @@ facet_wrap(
     vars(TIME_STEP_KEY), 
     nrow = 5,
     ncol=10
-  )
+  ) +
   theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank()) +
   theme(
     axis.title = element_blank(),
