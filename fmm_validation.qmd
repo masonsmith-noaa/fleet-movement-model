@@ -333,16 +333,17 @@ Groundfish catch.
 #| fig-height: 8.5
 
 ggplot() +
-  tidyterra::geom_spatvector(data = subset(catch_data2, catch_data2$YEAR %in% 2014:2020), aes(fill = GF_TOTAL_CATCH_MT), 
+  tidyterra::geom_spatvector(data = subset(catch_data2, catch_data2$YEAR %in% 2014), aes(fill = GF_TOTAL_CATCH_MT), 
                              alpha = 0.8, col = NA, na.rm = TRUE) +
   scale_fill_distiller(palette = "GnBu", name = "GF (mt)") +
   tidyterra::geom_spatvector(data = closure2, aes(color = "Closure"), 
                              fill = NA, alpha = 0.5, lwd = 0.5) +
   scale_color_manual(values = c("Closure" = "red"), name = NULL) +
- facet_grid(
-    YEAR~TIME_STEP_KEY,
-    switch = "y" # Optional: moves month labels to left margin for cleaner reading
-  ) +
+facet_wrap(
+    vars(TIME_STEP_KEY), 
+    nrow = 5,
+    ncol=10
+  )
   theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank()) +
   theme(
     axis.title = element_blank(),
@@ -361,16 +362,17 @@ PSC catch.
 #| fig-height: 8.5
 
 ggplot() +
-  tidyterra::geom_spatvector(data = subset(catch_data2, catch_data2$YEAR %in% 2014:2020), aes(fill = PSC_VALUE), 
+  tidyterra::geom_spatvector(data = subset(catch_data2, catch_data2$YEAR %in% 2014), aes(fill = PSC_VALUE), 
                              alpha = 0.8, col = NA, na.rm = TRUE) +
   scale_fill_distiller(palette = "GnBu", name = paste0(spp_title, " PSC (num)")) +
   tidyterra::geom_spatvector(data = closure2, aes(color = "Closure"), 
                              fill = NA, alpha = 0.5, lwd = 0.5) +
   scale_color_manual(values = c("Closure" = "red"), name = NULL) +
- facet_grid(
-    YEAR~TIME_STEP_KEY,
-    switch = "y" # Optional: moves month labels to left margin for cleaner reading
-  ) +
+facet_wrap(
+    vars(TIME_STEP_KEY), 
+    nrow = 5,
+    ncol=10
+  )
   theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank()) +
   theme(
     axis.title = element_blank(),
@@ -388,16 +390,17 @@ Effort.
 #| fig-height: 8.5
 
 ggplot() +
-  tidyterra::geom_spatvector(data = subset(catch_data2, catch_data2$YEAR %in% 2014:2020), aes(fill = EFFORT_MINUTES), 
+  tidyterra::geom_spatvector(data = subset(catch_data2, catch_data2$YEAR %in% 2014), aes(fill = EFFORT_MINUTES), 
                              alpha = 0.8, col = NA, na.rm = TRUE) +
   scale_fill_distiller(palette = "GnBu", name = "Effort (min") +
   tidyterra::geom_spatvector(data = closure2, aes(color = "Closure"), 
                              fill = NA, alpha = 0.5, lwd = 0.5) +
   scale_color_manual(values = c("Closure" = "red"), name = NULL) +
- facet_grid(
-    YEAR~TIME_STEP_KEY,
-    switch = "y" # Optional: moves month labels to left margin for cleaner reading
-  ) +
+facet_wrap(
+    vars(TIME_STEP_KEY), 
+    nrow = 5,
+    ncol=10
+  )
   theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank()) +
   theme(
     axis.title = element_blank(),
