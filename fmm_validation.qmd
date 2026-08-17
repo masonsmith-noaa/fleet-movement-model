@@ -27,7 +27,7 @@ execute:
 
 ## 1. Setup
 
-This analysis predicts the spatial movement and net PSC change for displaced vessels under hypothetical closures of the red king crab sub savings area (RKCSSA) and validates predictions against closures in 2022 and 2023. 
+This analysis predicts the spatial movement and net PSC change for displaced vessels under closures of the red king crab sub savings area (RKCSSA) and validates predictions against closures in 2022 and 2023. 
 
 ```{r}
 #| label: setup
