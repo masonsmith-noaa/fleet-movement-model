@@ -9,15 +9,15 @@ format:
     self-contained: true
 params:
   time_step: "weekly" # Options: "weekly", "monthly", "annual"
-  timeframe: [2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+  timeframe: [2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
   psc_spp: RKCR
   closure: rkcssa
-  buffer: 100000
+  buffer: 200000
   gear: NPT
   sector: CP
   management_code: 
   catch_type: GF_TOTAL_CATCH_MT   #GF_TOTAL_CATCH_MT, SHALLOW_FLATFISH_WEIGHT
-  lme: bs # (goa, ai, bs, or all)
+  lme: all # (goa, ai, bs, or all)
   method: both #options: m1, m2, both
 execute:
   warning: false
@@ -340,7 +340,7 @@ ggplot() +
                              fill = NA, alpha = 0.5, lwd = 0.5) +
   scale_color_manual(values = c("Closure" = "red"), name = NULL) +
 facet_wrap(
-    vars(TIME_STEP_KEY), 
+    vars(YEAR, TIME_STEP_KEY), 
     nrow = 5,
     ncol=10
   ) +
@@ -549,6 +549,8 @@ combined_rates_panel <- p1 +
 print(combined_rates_panel)
 
 ```
+
+
 
 By year, sufficient high temporal autocorrelation.
 ```{r}
@@ -1293,28 +1295,22 @@ This step runs an AR(1) projection for each year using the data available to it 
 ```{r}
 
 # ==============================================================================
-# STEP 1: DIFFERENCED ARIMA(1,1,0) WITH 5-YEAR ROLLING MEMORY & t-1 FOOTPRINT
+# STEP 1: FIRST-DIFFERENCED AR(1) MODEL WITH STRICT 1-YEAR MEMORY (FIXED)
 # ==============================================================================
-#| label: step1-ar1-differenced-5yr
+#| label: step1-ar1-differenced-t1-fixed
 
 suppressPackageStartupMessages({
   library(dplyr)
   library(tidyr)
 })
 
-# 1. DIFFERENCED / RANDOM WALK ARIMA(1, 1, 0) FORECASTING FUNCTION
-forecast_ar1_differenced <- function(series_vec) {
+forecast_ar1_differenced_t1 <- function(series_vec) {
   series_vec <- series_vec[!is.na(series_vec)]
   n <- length(series_vec)
   
   if (n == 0) return(c(pred = 0, se = 0))
-  if (n == 1) return(c(pred = series_vec[1], se = 0))
+  if (n == 1) return(c(pred = series_vec[1], se = series_vec[1] * 0.10))
   if (var(series_vec) == 0) return(c(pred = series_vec[n], se = 0))
-  
-  # If n <= 3 within the 5-year window, fallback to Last-Observation-Carried-Forward
-  if (n <= 3) {
-    return(c(pred = series_vec[n], se = sd(series_vec) / sqrt(pmax(1, n))))
-  }
   
   fit <- tryCatch({
     suppressWarnings(
@@ -1326,70 +1322,68 @@ forecast_ar1_differenced <- function(series_vec) {
     p <- predict(fit, n.ahead = 1)
     return(c(pred = pmax(0, as.numeric(p$pred[1])), se = as.numeric(p$se[1])))
   } else {
-    # Fallback to Last-Observation-Carried-Forward (LOCF)
-    return(c(pred = series_vec[n], se = sd(series_vec, na.rm = TRUE)))
+    return(c(pred = series_vec[n], se = series_vec[n] * 0.10))
   }
 }
 
-# 2. ROLLING FORECAST LOOP WITH 5-YEAR HISTORICAL MEMORY [t-5, t-1] & t-1 FOOTPRINT
-all_years  <- sort(unique(catch_data_binned$YEAR))
-eval_years <- all_years[all_years >= (min(all_years) + 3)] # Evaluates 2012+
+window_size <- 1  
+all_years   <- sort(unique(catch_data_binned$YEAR))
+eval_years  <- all_years[all_years >= (min(all_years) + window_size)]
+
+# Master grid template across all spatial keys to prevent dropping/caching keys
+master_spatial_grid <- catch_data_binned %>%
+  dplyr::select(TIME_STEP_KEY, STAT_AREA, HARVEST_SECTOR, SPECIES_GROUP_CODE) %>%
+  dplyr::distinct()
 
 predicted_primitives_list <- list()
 
 for (target_yr in eval_years) {
   
   prior_yr  <- target_yr - 1
-  mem_start <- target_yr - 5  # STRICT 5-YEAR ROLLING MEMORY FLOOR [t-5, t-1]
   
-  # A. Historical memory: strictly restricted to 5-year trailing window
+  # A. Pull strictly Year prior_yr data
   hist_memory <- catch_data_binned %>%
     dplyr::filter(
-      YEAR >= mem_start & YEAR < target_yr,
+      YEAR == prior_yr,
       STAT_AREA %in% local_stat_areas
     ) %>%
     dplyr::mutate(
       cell_rate_mt = ifelse(GF_TOTAL_CATCH_MT >= 1.0, PSC_VALUE / GF_TOTAL_CATCH_MT, 0)
     )
   
-  # B. ACTIVE SPATIAL DOMAIN: Cells active in Year t-1 ONLY
-  active_cells_t1 <- catch_data_binned %>%
-    dplyr::filter(YEAR == prior_yr, GF_TOTAL_CATCH_MT > 0) %>%
-    dplyr::select(TIME_STEP_KEY, STAT_AREA, HARVEST_SECTOR, SPECIES_GROUP_CODE) %>%
-    dplyr::distinct()
-  
-  # C. Fit Differenced AR(1,1,0) models & mask by t-1 footprint
+  # B. Calculate forecast for target_yr
   grid_forecast <- hist_memory %>%
     dplyr::group_by(TIME_STEP_KEY, STAT_AREA, HARVEST_SECTOR, SPECIES_GROUP_CODE) %>%
     dplyr::summarise(
-      fc_gf   = list(forecast_ar1_differenced(GF_TOTAL_CATCH_MT)),
-      fc_rate = list(forecast_ar1_differenced(cell_rate_mt)),
-      fc_eff  = list(forecast_ar1_differenced(EFFORT_MINUTES)),
+      fc_gf   = list(forecast_ar1_differenced_t1(GF_TOTAL_CATCH_MT)),
+      fc_rate = list(forecast_ar1_differenced_t1(cell_rate_mt)),
+      fc_eff  = list(forecast_ar1_differenced_t1(EFFORT_MINUTES)),
       .groups = "drop"
     ) %>%
-    dplyr::inner_join(
-      active_cells_t1,
+    dplyr::right_join(
+      master_spatial_grid %>% dplyr::filter(STAT_AREA %in% local_stat_areas),
       by = c("TIME_STEP_KEY", "STAT_AREA", "HARVEST_SECTOR", "SPECIES_GROUP_CODE")
     ) %>%
     dplyr::mutate(
       YEAR               = as.integer(target_yr),
       
-      GF_TOTAL_CATCH_MT  = pmax(0, sapply(fc_gf, function(x) x["pred"])),
-      se_gf_mt           = sapply(fc_gf, function(x) x["se"]),
+      # Extract predictions (replace NA with 0 if spatial key was inactive in t-1)
+      GF_TOTAL_CATCH_MT  = pmax(0, tidyr::replace_na(sapply(fc_gf, function(x) if(is.null(x)) 0 else x["pred"]), 0)),
+      se_gf_mt           = tidyr::replace_na(sapply(fc_gf, function(x) if(is.null(x)) 0 else x["se"]), 0),
       
-      pred_rate_mt       = pmax(0, sapply(fc_rate, function(x) x["pred"])),
+      pred_rate_mt       = pmax(0, tidyr::replace_na(sapply(fc_rate, function(x) if(is.null(x)) 0 else x["pred"]), 0)),
+      se_rate            = tidyr::replace_na(sapply(fc_rate, function(x) if(is.null(x)) 0 else x["se"]), 0),
       
-      # Derived PSC Value: GF * Rate
       PSC_VALUE          = GF_TOTAL_CATCH_MT * pred_rate_mt,
-      se_psc             = sapply(fc_rate, function(x) x["se"]) * GF_TOTAL_CATCH_MT,
+      se_psc             = se_rate * GF_TOTAL_CATCH_MT,
       
-      EFFORT_MINUTES     = as.integer(round(pmax(1, sapply(fc_eff, function(x) x["pred"])))),
-      se_eff_mins        = sapply(fc_eff, function(x) x["se"])
+      EFFORT_MINUTES     = as.integer(round(pmax(0, tidyr::replace_na(sapply(fc_eff, function(x) if(is.null(x)) 0 else x["pred"]), 0)))),
+      se_eff_mins        = tidyr::replace_na(sapply(fc_eff, function(x) if(is.null(x)) 0 else x["se"]), 0)
     ) %>%
     dplyr::select(
       YEAR, TIME_STEP_KEY, STAT_AREA, HARVEST_SECTOR, SPECIES_GROUP_CODE,
-      GF_TOTAL_CATCH_MT, PSC_VALUE, EFFORT_MINUTES,
-      se_gf_mt, se_psc, se_eff_mins
+      GF_TOTAL_CATCH_MT, PSC_VALUE, EFFORT_MINUTES, pred_rate_mt,
+      se_gf_mt, se_rate, se_psc, se_eff_mins
     )
   
   predicted_primitives_list[[as.character(target_yr)]] <- grid_forecast
@@ -1403,6 +1397,7 @@ predicted_primitives_df <- do.call(rbind, predicted_primitives_list)
 ## 2. Run each estimation method
 
 ```{r}
+
 # ==============================================================================
 # STEP 2: RUN METHOD 1 (PSC/GF RATES) & METHOD 2 (CPUE EFFORT)
 # ==============================================================================
@@ -1451,7 +1446,6 @@ run_redistribution_pipeline <- function(pred_df, is_closure_active) {
     dplyr::summarise(
       tons_gf_inside_wk     = sum(GF_TOTAL_CATCH_MT * (impacted == "yes"), na.rm = TRUE),
       psc_measure_inside_wk = sum(PSC_VALUE * (impacted == "no"), na.rm = TRUE),
-      # Safely handle NA effort for unobserved landings
       effort_inside_wk      = ifelse(all(is.na(EFFORT_MINUTES)), NA_real_, sum(EFFORT_MINUTES, na.rm = TRUE)),
       .groups = "drop"
     )
@@ -1470,7 +1464,7 @@ run_redistribution_pipeline <- function(pred_df, is_closure_active) {
     w_start <- max(min_pred_yr, target_yr - 3)
     w_end   <- max(min_pred_yr, target_yr - 1)
     
-    if(target_yr == min_pred_yr) { w_start <- target_yr; w_end <- target_yr }
+    if (target_yr == min_pred_yr) { w_start <- target_yr; w_end <- target_yr }
     
     hist_window <- catch_data_binned %>%
       dplyr::filter(
@@ -1485,9 +1479,9 @@ run_redistribution_pipeline <- function(pred_df, is_closure_active) {
         .groups = "drop"
       ) %>%
       dplyr::mutate(
-        hist_gf_cpue_seasonal  = ifelse(target_yr > min_pred_yr & !is.na(sum_effort_3yr) & sum_effort_3yr > 0, 
+        hist_gf_cpue_seasonal  = ifelse(!is.na(sum_effort_3yr) & sum_effort_3yr > 0, 
                                         sum_tons_3yr / sum_effort_3yr, NA_real_),
-        hist_psc_rate_mins_3yr = ifelse(target_yr > min_pred_yr & !is.na(sum_effort_3yr) & sum_effort_3yr > 0, 
+        hist_psc_rate_mins_3yr = ifelse(!is.na(sum_effort_3yr) & sum_effort_3yr > 0, 
                                         sum_psc_3yr / sum_effort_3yr, NA_real_),
         YEAR = target_yr,
         DYNAMIC_SEASONAL_KEY = TIME_STEP_KEY
@@ -1547,7 +1541,6 @@ run_redistribution_pipeline <- function(pred_df, is_closure_active) {
       by = c("DYNAMIC_SEASONAL_KEY", "HARVEST_SECTOR")
     ) %>%
     dplyr::mutate(
-      # Coalesce to regional fallback whenever local stat cell CPUE is NA
       hist_gf_cpue_seasonal  = dplyr::coalesce(hist_gf_cpue_seasonal, reg_cpue_fallback),
       hist_psc_rate_mins_3yr = dplyr::coalesce(hist_psc_rate_mins_3yr, reg_psc_mins_fallback, 0)
     ) %>%
@@ -1563,10 +1556,10 @@ run_redistribution_pipeline <- function(pred_df, is_closure_active) {
       tons_gf_inside_wk = tidyr::replace_na(tons_gf_inside_wk, 0),
       gf_catch_new      = tons_gf_inside_wk * proportion_outside_wk,
       
-      # Method 1
+      # Method 1: Pure Volume
       new_PSC_method1   = gf_catch_new * mean_psc_rate_wk,
       
-      # Method 2
+      # Method 2: CPUE Effort Constrained
       effort_minutes_needed = ifelse(!is.na(hist_gf_cpue_seasonal) & hist_gf_cpue_seasonal > 0, 
                                      gf_catch_new / hist_gf_cpue_seasonal, 0),
       new_PSC_method2       = effort_minutes_needed * tidyr::replace_na(hist_psc_rate_mins_3yr, 0)
@@ -1610,7 +1603,7 @@ run_redistribution_pipeline <- function(pred_df, is_closure_active) {
   return(total.join.plot.annual.pred)
 }
 
-# Run both scenario passes
+# Run both scenario passes cleanly
 pred_sq_df      <- run_redistribution_pipeline(predicted_primitives_df, is_closure_active = FALSE)
 pred_closure_df <- run_redistribution_pipeline(predicted_primitives_df, is_closure_active = TRUE)
 
@@ -1880,6 +1873,135 @@ callout_block <- sprintf(
 )
 
 # Force knitr to output as direct Markdown (prevents code block wrapping)
+knitr::asis_output(callout_block)
+
+```
+
+
+
+
+
+```{r}
+
+# ==============================================================================
+# SECTION 4: REAL-WORLD CLOSURE VALIDATION (HISTORICAL BASELINE ANCHOR)
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(knitr)
+})
+
+# 1. Compute 3-Year Pre-Closure Historical Baseline (2019 - 2021 Open Fishery Mean)
+pre_closure_baseline <- val_all5_df %>%
+  dplyr::filter(YEAR %in% c(2019, 2020, 2021)) %>%
+  dplyr::summarise(
+    hist_mean_psc = mean(psc_statusquo, na.rm = TRUE)
+  ) %>%
+  dplyr::pull(hist_mean_psc)
+
+# 2. Evaluate 2022-2023 Realized Policy Reductions vs Historical Baseline
+historical_validation <- val_all5_df %>%
+  dplyr::filter(YEAR %in% c(2022, 2023)) %>%
+  dplyr::mutate(
+    # Fixed Benchmark Anchor
+    Hist_Open_Baseline    = pre_closure_baseline,
+    
+    # Observed Reality during closure
+    Observed_Closure_PSC  = psc_statusquo,
+    
+    # Realized Empirical Drop vs Pre-Closure Mean
+    Empirical_Drop_Pct    = ((Observed_Closure_PSC - Hist_Open_Baseline) / Hist_Open_Baseline) * 100,
+    
+    # Model Predicted Drops vs Pre-Closure Mean
+    Model_M1_Drop_Pct     = ((proj_m1_mean - Hist_Open_Baseline) / Hist_Open_Baseline) * 100,
+    Model_M2_Drop_Pct     = ((proj_m2_mean - Hist_Open_Baseline) / Hist_Open_Baseline) * 100,
+    
+    # Validation Absolute Error (in Percentage Points)
+    M1_Error_PctPoints    = abs(Model_M1_Drop_Pct - Empirical_Drop_Pct),
+    M2_Error_PctPoints    = abs(Model_M2_Drop_Pct - Empirical_Drop_Pct)
+  ) %>%
+  dplyr::select(
+    Year                  = YEAR,
+    `Pre-Closure Baseline` = Hist_Open_Baseline,
+    `Observed Closure PSC`= Observed_Closure_PSC,
+    `Empirical Drop %`    = Empirical_Drop_Pct,
+    `Model M1 Drop %`     = Model_M1_Drop_Pct,
+    `Model M2 Drop %`     = Model_M2_Drop_Pct,
+    `M1 Error (pp)`       = M1_Error_PctPoints,
+    `M2 Error (pp)`       = M2_Error_PctPoints
+  )
+
+# Print cleanly to console
+print(as.data.frame(dplyr::mutate_if(historical_validation, is.numeric, round, 1)))
+
+# Render Markdown Table
+knitr::kable(
+  historical_validation, 
+  digits = 1,
+  caption = "Policy Validation: % Realized Reductions and Model Projections From Historical Baseline (2019–2021 Average)"
+)
+
+```
+
+
+```{r}
+
+#| label: validation-summary-statement
+#| echo: false
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(knitr)
+})
+
+fmt_pct <- function(x) sprintf("%+.1f%%", x)
+
+# Extract values directly from historical_validation
+emp_2022 <- historical_validation %>% dplyr::filter(Year == 2022) %>% dplyr::pull(`Empirical Drop %`)
+emp_2023 <- historical_validation %>% dplyr::filter(Year == 2023) %>% dplyr::pull(`Empirical Drop %`)
+
+m1_2022  <- historical_validation %>% dplyr::filter(Year == 2022) %>% dplyr::pull(`Model M1 Drop %`)
+m2_2022  <- historical_validation %>% dplyr::filter(Year == 2022) %>% dplyr::pull(`Model M2 Drop %`)
+
+m1_2023  <- historical_validation %>% dplyr::filter(Year == 2023) %>% dplyr::pull(`Model M1 Drop %`)
+m2_2023  <- historical_validation %>% dplyr::filter(Year == 2023) %>% dplyr::pull(`Model M2 Drop %`)
+
+# Absolute error in percentage points (pp)
+err_pp_2022 <- mean(c(
+  historical_validation %>% dplyr::filter(Year == 2022) %>% dplyr::pull(`M1 Error (pp)`),
+  historical_validation %>% dplyr::filter(Year == 2022) %>% dplyr::pull(`M2 Error (pp)`)
+))
+
+err_pp_2023 <- mean(c(
+  historical_validation %>% dplyr::filter(Year == 2023) %>% dplyr::pull(`M1 Error (pp)`),
+  historical_validation %>% dplyr::filter(Year == 2023) %>% dplyr::pull(`M2 Error (pp)`)
+))
+
+# Build dynamic text
+if (abs(m1_2023 - m2_2023) < 0.1) {
+  m2023_text <- sprintf("%.1f %% decline (both methods 1 and 2)", m1_2023)
+} else {
+  m2023_text <- sprintf("%.1f to %.1f %% declines (method 1 and 2, respectively)", m1_2023, m2_2023)
+}
+
+text_out <- sprintf(
+  "Compared to the 2019–2021 pre-closure baseline, the %s closure produced a PSC reduction of **%s** in 2022 and **%s** in 2023. Under AR(1) catch and PSC rate projections, the models projected %.1f to %.1f %% declines (method 1 and 2, respectively) in 2022, and a %s in 2023. Model prediction error was roughly **%.1f percentage points** in 2022 and **%.1f percentage points** in 2023.",
+  toupper(params$closure),
+  fmt_pct(emp_2022),
+  fmt_pct(emp_2023),
+  m1_2022,
+  m2_2022,
+  m2023_text,
+  err_pp_2022,
+  err_pp_2023
+)
+
+callout_block <- sprintf(
+  "\n\n::: {.callout-note appearance=\"simple\" icon=false}\n%s\n:::\n\n",
+  text_out
+)
+
 knitr::asis_output(callout_block)
 
 ```

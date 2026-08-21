@@ -282,10 +282,10 @@ Effort
 
 ```{r}
 
-#| label: fig-gf-catch
+#| label: fig-gf-effort
 #| fig-cap: "Simulated weekly groundfish effort distributions."
-#| fig-width: 12
-#| fig-height: 8
+#| fig-width: 10
+#| fig-height: 1
 ggplot() +
   tidyterra::geom_spatvector(data = subset(catch_data2, catch_data2$YEAR==2018), aes(fill = EFFORT_MINUTES), 
                              alpha = 0.8, col = NA, na.rm = TRUE) +
@@ -293,7 +293,7 @@ ggplot() +
   tidyterra::geom_spatvector(data = closure2, aes(color = "Closure"), 
                              fill = NA, alpha = 0.5, lwd = 0.5) +
   scale_color_manual(values = c("Closure" = "red"), name = NULL) +
-  facet_wrap(~TIME_STEP_KEY, ncol=10) +
+  facet_wrap(~TIME_STEP_KEY, ncol=4) +
   theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank())
 
 ```
@@ -304,8 +304,8 @@ Catch
 
 #| label: fig-gf-catch
 #| fig-cap: "Simulated weekly groundfish catch distributions."
-#| fig-width: 12
-#| fig-height: 8
+#| fig-width: 10
+#| fig-height: 2
 ggplot() +
   tidyterra::geom_spatvector(data = subset(catch_data2, catch_data2$YEAR==2018), aes(fill = GF_TOTAL_CATCH_MT), 
                              alpha = 0.8, col = NA, na.rm = TRUE) +
@@ -313,7 +313,7 @@ ggplot() +
   tidyterra::geom_spatvector(data = closure2, aes(color = "Closure"), 
                              fill = NA, alpha = 0.5, lwd = 0.5) +
   scale_color_manual(values = c("Closure" = "red"), name = NULL) +
-  facet_wrap(~TIME_STEP_KEY, ncol=10) +
+  facet_wrap(~TIME_STEP_KEY, ncol=4) +
   theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank())
 
 ```
@@ -323,8 +323,8 @@ PSC
 
 #| label: fig-gf-catch
 #| fig-cap: "Simulated weekly groundfish catch distributions."
-#| fig-width: 12
-#| fig-height: 8
+#| fig-width: 10
+#| fig-height: 2
 ggplot() +
   tidyterra::geom_spatvector(data = subset(catch_data2, catch_data2$YEAR==2018), aes(fill = PSC_VALUE), 
                              alpha = 0.8, col = NA, na.rm = TRUE) +
@@ -332,7 +332,7 @@ ggplot() +
   tidyterra::geom_spatvector(data = closure2, aes(color = "Closure"), 
                              fill = NA, alpha = 0.5, lwd = 0.5) +
   scale_color_manual(values = c("Closure" = "red"), name = NULL) +
-  facet_wrap(~TIME_STEP_KEY, ncol=10) +
+  facet_wrap(~TIME_STEP_KEY, ncol=4) +
   theme_bw() + theme(plot.title = element_text(hjust = 0.5), axis.title = element_blank())
 
 ```
@@ -1173,28 +1173,22 @@ This step runs an AR(1) projection for each year using the data available to it 
 ```{r}
 
 # ==============================================================================
-# STEP 1: DIFFERENCED ARIMA(1,1,0) WITH 5-YEAR ROLLING MEMORY & t-1 FOOTPRINT
+# STEP 1: FIRST-DIFFERENCED AR(1) MODEL WITH STRICT 1-YEAR MEMORY (FIXED)
 # ==============================================================================
-#| label: step1-ar1-differenced-5yr
+#| label: step1-ar1-differenced-t1-fixed
 
 suppressPackageStartupMessages({
   library(dplyr)
   library(tidyr)
 })
 
-# 1. DIFFERENCED / RANDOM WALK ARIMA(1, 1, 0) FORECASTING FUNCTION
-forecast_ar1_differenced <- function(series_vec) {
+forecast_ar1_differenced_t1 <- function(series_vec) {
   series_vec <- series_vec[!is.na(series_vec)]
   n <- length(series_vec)
   
   if (n == 0) return(c(pred = 0, se = 0))
-  if (n == 1) return(c(pred = series_vec[1], se = 0))
+  if (n == 1) return(c(pred = series_vec[1], se = series_vec[1] * 0.10))
   if (var(series_vec) == 0) return(c(pred = series_vec[n], se = 0))
-  
-  # If n <= 3 within the 5-year window, fallback to Last-Observation-Carried-Forward
-  if (n <= 3) {
-    return(c(pred = series_vec[n], se = sd(series_vec) / sqrt(pmax(1, n))))
-  }
   
   fit <- tryCatch({
     suppressWarnings(
@@ -1206,70 +1200,68 @@ forecast_ar1_differenced <- function(series_vec) {
     p <- predict(fit, n.ahead = 1)
     return(c(pred = pmax(0, as.numeric(p$pred[1])), se = as.numeric(p$se[1])))
   } else {
-    # Fallback to Last-Observation-Carried-Forward (LOCF)
-    return(c(pred = series_vec[n], se = sd(series_vec, na.rm = TRUE)))
+    return(c(pred = series_vec[n], se = series_vec[n] * 0.10))
   }
 }
 
-# 2. ROLLING FORECAST LOOP WITH 5-YEAR HISTORICAL MEMORY [t-5, t-1] & t-1 FOOTPRINT
-all_years  <- sort(unique(catch_data_binned$YEAR))
-eval_years <- all_years[all_years >= (min(all_years) + 3)] # Evaluates 2012+
+window_size <- 1  
+all_years   <- sort(unique(catch_data_binned$YEAR))
+eval_years  <- all_years[all_years >= (min(all_years) + window_size)]
+
+# Master grid template across all spatial keys to prevent dropping/caching keys
+master_spatial_grid <- catch_data_binned %>%
+  dplyr::select(TIME_STEP_KEY, STAT_AREA, HARVEST_SECTOR, SPECIES_GROUP_CODE) %>%
+  dplyr::distinct()
 
 predicted_primitives_list <- list()
 
 for (target_yr in eval_years) {
   
   prior_yr  <- target_yr - 1
-  mem_start <- target_yr - 5  # STRICT 5-YEAR ROLLING MEMORY FLOOR [t-5, t-1]
   
-  # A. Historical memory: strictly restricted to 5-year trailing window
+  # A. Pull strictly Year prior_yr data
   hist_memory <- catch_data_binned %>%
     dplyr::filter(
-      YEAR >= mem_start & YEAR < target_yr,
+      YEAR == prior_yr,
       STAT_AREA %in% local_stat_areas
     ) %>%
     dplyr::mutate(
       cell_rate_mt = ifelse(GF_TOTAL_CATCH_MT >= 1.0, PSC_VALUE / GF_TOTAL_CATCH_MT, 0)
     )
   
-  # B. ACTIVE SPATIAL DOMAIN: Cells active in Year t-1 ONLY
-  active_cells_t1 <- catch_data_binned %>%
-    dplyr::filter(YEAR == prior_yr, GF_TOTAL_CATCH_MT > 0) %>%
-    dplyr::select(TIME_STEP_KEY, STAT_AREA, HARVEST_SECTOR, SPECIES_GROUP_CODE) %>%
-    dplyr::distinct()
-  
-  # C. Fit Differenced AR(1,1,0) models & mask by t-1 footprint
+  # B. Calculate forecast for target_yr
   grid_forecast <- hist_memory %>%
     dplyr::group_by(TIME_STEP_KEY, STAT_AREA, HARVEST_SECTOR, SPECIES_GROUP_CODE) %>%
     dplyr::summarise(
-      fc_gf   = list(forecast_ar1_differenced(GF_TOTAL_CATCH_MT)),
-      fc_rate = list(forecast_ar1_differenced(cell_rate_mt)),
-      fc_eff  = list(forecast_ar1_differenced(EFFORT_MINUTES)),
+      fc_gf   = list(forecast_ar1_differenced_t1(GF_TOTAL_CATCH_MT)),
+      fc_rate = list(forecast_ar1_differenced_t1(cell_rate_mt)),
+      fc_eff  = list(forecast_ar1_differenced_t1(EFFORT_MINUTES)),
       .groups = "drop"
     ) %>%
-    dplyr::inner_join(
-      active_cells_t1,
+    dplyr::right_join(
+      master_spatial_grid %>% dplyr::filter(STAT_AREA %in% local_stat_areas),
       by = c("TIME_STEP_KEY", "STAT_AREA", "HARVEST_SECTOR", "SPECIES_GROUP_CODE")
     ) %>%
     dplyr::mutate(
       YEAR               = as.integer(target_yr),
       
-      GF_TOTAL_CATCH_MT  = pmax(0, sapply(fc_gf, function(x) x["pred"])),
-      se_gf_mt           = sapply(fc_gf, function(x) x["se"]),
+      # Extract predictions (replace NA with 0 if spatial key was inactive in t-1)
+      GF_TOTAL_CATCH_MT  = pmax(0, tidyr::replace_na(sapply(fc_gf, function(x) if(is.null(x)) 0 else x["pred"]), 0)),
+      se_gf_mt           = tidyr::replace_na(sapply(fc_gf, function(x) if(is.null(x)) 0 else x["se"]), 0),
       
-      pred_rate_mt       = pmax(0, sapply(fc_rate, function(x) x["pred"])),
+      pred_rate_mt       = pmax(0, tidyr::replace_na(sapply(fc_rate, function(x) if(is.null(x)) 0 else x["pred"]), 0)),
+      se_rate            = tidyr::replace_na(sapply(fc_rate, function(x) if(is.null(x)) 0 else x["se"]), 0),
       
-      # Derived PSC Value: GF * Rate
       PSC_VALUE          = GF_TOTAL_CATCH_MT * pred_rate_mt,
-      se_psc             = sapply(fc_rate, function(x) x["se"]) * GF_TOTAL_CATCH_MT,
+      se_psc             = se_rate * GF_TOTAL_CATCH_MT,
       
-      EFFORT_MINUTES     = as.integer(round(pmax(1, sapply(fc_eff, function(x) x["pred"])))),
-      se_eff_mins        = sapply(fc_eff, function(x) x["se"])
+      EFFORT_MINUTES     = as.integer(round(pmax(0, tidyr::replace_na(sapply(fc_eff, function(x) if(is.null(x)) 0 else x["pred"]), 0)))),
+      se_eff_mins        = tidyr::replace_na(sapply(fc_eff, function(x) if(is.null(x)) 0 else x["se"]), 0)
     ) %>%
     dplyr::select(
       YEAR, TIME_STEP_KEY, STAT_AREA, HARVEST_SECTOR, SPECIES_GROUP_CODE,
-      GF_TOTAL_CATCH_MT, PSC_VALUE, EFFORT_MINUTES,
-      se_gf_mt, se_psc, se_eff_mins
+      GF_TOTAL_CATCH_MT, PSC_VALUE, EFFORT_MINUTES, pred_rate_mt,
+      se_gf_mt, se_rate, se_psc, se_eff_mins
     )
   
   predicted_primitives_list[[as.character(target_yr)]] <- grid_forecast
